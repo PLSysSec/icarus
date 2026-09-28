@@ -189,6 +189,14 @@ pub enum RefKind {
     Param,
     /// A local introduced by a `LetStmt`: `lhs`, `rhs`.
     Local,
+    /// A variable declared outside the callable: a namespace-scope global, or a
+    /// class-scope `static` like `Assembler::NotEqual`.
+    ///
+    /// Distinguished from [`RefKind::Local`] because the name alone doesn't
+    /// carry the scope it came from. Emitting one unqualified would put it in
+    /// whatever scope the generated code has, where it means nothing -- or,
+    /// worse, binds to a local that happens to share the name.
+    Global,
 }
 
 /// A C++ type, with the structure the name only renders.
@@ -1112,6 +1120,17 @@ fn extract_call(e: Entity) -> Result<Call> {
     Ok(Call { callee, args })
 }
 
+/// Whether a declaration sits inside a function or method body.
+///
+/// A local's semantic parent is the callable that declares it; a global's is a
+/// namespace or the translation unit, and a class-scope `static`'s is the class.
+fn declared_in_callable(decl: Entity) -> bool {
+    matches!(
+        decl.get_semantic_parent().map(|p| p.get_kind()),
+        Some(EntityKind::FunctionDecl | EntityKind::Method | EntityKind::FunctionTemplate)
+    )
+}
+
 fn extract_ref(e: Entity) -> Result<Expr> {
     let name = e.get_name().unwrap_or_default();
     let target = e.get_reference().ok_or_else(|| Unsupported::Expr {
@@ -1134,8 +1153,15 @@ fn extract_ref(e: Entity) -> Result<Expr> {
             name,
             ty: extract_type(target)?,
         })),
+        // A variable, which is a local only when the callable being translated
+        // is the one that declared it. `Assembler::NotEqual` is a `VarDecl` too
+        // -- a class-scope `static const` -- and nothing in the name says so.
         EntityKind::VarDecl => Ok(Expr::Ref(Ref {
-            kind: RefKind::Local,
+            kind: if declared_in_callable(target) {
+                RefKind::Local
+            } else {
+                RefKind::Global
+            },
             name,
             ty: extract_type(target)?,
         })),
@@ -1540,6 +1566,7 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
                 RefKind::Field => "Field",
                 RefKind::Param => "Param",
                 RefKind::Local => "Local",
+                RefKind::Global => "Global",
             };
             writeln!(f, "{kind} `{}` : {}", r.name, r.ty.spelled)
         }
