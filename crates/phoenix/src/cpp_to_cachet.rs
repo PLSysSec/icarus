@@ -29,7 +29,7 @@ use crate::cpp_subset::{
 };
 use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
 use crate::masm_ops::masm_call;
-use crate::scopes::Scopes;
+use crate::scopes::{Obligation, Scopes};
 
 /// Whether leaving a construct out still leaves a model of the C++.
 ///
@@ -44,6 +44,14 @@ pub enum Fidelity {
     /// Not translatable. Whatever came out is not what the C++ does, so
     /// verifying it would verify the wrong program.
     Failed,
+    /// The C++ breaks an invariant the model and the C++ both rely on, so there is
+    /// nothing faithful to produce.
+    ///
+    /// Distinct from [`Fidelity::Failed`] because it points somewhere else: not at
+    /// a construct phoenix cannot express, but at a fault in the source -- or in
+    /// our reading of it, which is the likelier of the two and the reason it is
+    /// reported rather than asserted.
+    Invalid,
 }
 
 /// A place where the output falls short of the C++.
@@ -92,6 +100,14 @@ impl Unhandled {
     pub fn elided(what: impl Into<String>) -> Self {
         Unhandled {
             fidelity: Fidelity::Elided,
+            ..Unhandled::new(what)
+        }
+    }
+
+    /// For C++ that breaks an invariant the translation depends on.
+    pub fn invalid(what: impl Into<String>) -> Self {
+        Unhandled {
+            fidelity: Fidelity::Invalid,
             ..Unhandled::new(what)
         }
     }
@@ -1269,9 +1285,13 @@ fn translate_stmt_values(
                     .map(|v| translate_expr(ctx, state, v))
                     .transpose()?
             };
-            Ok(vec![Spanned::internal(Stmt::Ret(RetStmt {
+            // Leaving the op, so anything outstanding is discharged first, whether
+            // this block took it out or inherited it.
+            let mut stmts = discharge(state.scopes.on_return());
+            stmts.push(Spanned::internal(Stmt::Ret(RetStmt {
                 value: Spanned::internal(value),
-            }))])
+            })));
+            Ok(stmts)
         }
         CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(CachetIfStmt {
             cond: Spanned::internal(translate_expr(ctx, state, &s.cond)?),
@@ -1515,10 +1535,26 @@ fn unhandled_comment(e: &Unhandled, stmt: &CppSpan) -> Comment {
 /// Returns how many statements were consumed and what they became, or `None`
 /// where no pattern applies and the statements translate one by one. One helper
 /// per pattern, each matching a prefix of `stmts`.
+/// The statements consumed, and what they become. An `Err` consumed them too, so
+/// the caller advances either way.
 fn translate_known_block(
+    state: &mut State,
     stmts: &[CppSpanned<CppStmt>],
-) -> Option<(usize, Vec<Spanned<Stmt>>)> {
-    translate_add_failure_path(stmts)
+) -> Option<(usize, Result<Vec<Spanned<Stmt>>, Unhandled>)> {
+    let (consumed, translated) = translate_add_failure_path(stmts)?;
+    // Outstanding from here until this block releases it or a `return` does: the
+    // model has no `nextOp()` to clear the flag between instructions.
+    if !state.scopes.acquire_failure_path() {
+        return Some((
+            consumed,
+            Err(Unhandled::invalid(
+                "a second failure path while one is outstanding, which \
+                 `setAddedFailurePath` asserts against: \"multiple failure paths \
+                 for instruction\"",
+            )),
+        ));
+    }
+    Some((consumed, Ok(translated)))
 }
 
 /// ```text
@@ -1643,8 +1679,16 @@ fn translate_block_stmts(
     while let [stmt, tail @ ..] = rest {
         // A multi-statement idiom takes precedence, since its statements don't
         // translate on their own.
-        if let Some((consumed, translated)) = translate_known_block(rest) {
-            stmts.extend(translated);
+        if let Some((consumed, translated)) = translate_known_block(state, rest) {
+            match translated {
+                Ok(translated) => stmts.extend(translated),
+                Err(e) => {
+                    stmts.push(Spanned::internal(Stmt::from(unhandled_comment(
+                        &e, &stmt.span,
+                    ))));
+                    state.gaps.push(e.into_gap(&stmt.span));
+                }
+            }
             rest = &rest[consumed..];
             continue;
         }
@@ -1659,10 +1703,27 @@ fn translate_block_stmts(
         }
         rest = tail;
     }
+    // Falling out of the block. A `return` discharged its own path already, so this
+    // fires only where the block ends by running off the end.
+    stmts.extend(discharge(state.scopes.on_scope_end()));
     Ok(Block {
         stmts,
         value: Spanned::internal(None),
     })
+}
+
+/// The statements that discharge what leaving a scope owes.
+///
+/// Inserted, never translated: no C++ line corresponds to any of them.
+fn discharge(obligations: Vec<Obligation>) -> Vec<Spanned<Stmt>> {
+    obligations
+        .into_iter()
+        .map(|obligation| match obligation {
+            Obligation::ReleaseFailurePath => Spanned::internal(Stmt::Expr(invoke(
+                CachetPath::from_ident("CacheIR").nest(Ident::from("releaseFailurePath")),
+            ))),
+        })
+        .collect()
 }
 
 /// A helper the generators call:
@@ -1851,16 +1912,24 @@ impl Translation {
     /// Whether the module models the C++, and so may be verified.
     ///
     /// Elided gaps don't count: they weaken the proof without changing what the
-    /// model says. A single `Failed` gap anywhere does, including in a helper --
-    /// the generator's own body may be perfect and still call into a lie.
+    /// model says. Anything else does, anywhere, including in a helper -- the
+    /// generator's own body may be perfect and still call into a lie.
     pub fn is_faithful(&self) -> bool {
-        !self.gaps.iter().any(|g| g.fidelity == Fidelity::Failed)
+        !self.gaps.iter().any(|g| g.fidelity != Fidelity::Elided)
     }
 
     pub fn failures(&self) -> impl Iterator<Item = &Gap> {
         self.gaps
             .iter()
             .filter(|g| g.fidelity == Fidelity::Failed)
+    }
+
+    /// Reported apart from [`Translation::failures`]: the same verdict, a different
+    /// place to go looking.
+    pub fn invalid(&self) -> impl Iterator<Item = &Gap> {
+        self.gaps
+            .iter()
+            .filter(|g| g.fidelity == Fidelity::Invalid)
     }
 
     pub fn elisions(&self) -> impl Iterator<Item = &Gap> {
@@ -1873,10 +1942,20 @@ impl Translation {
     pub fn summary(&self) -> String {
         let elided = self.elisions().count();
         let failed = self.failures().count();
-        if failed == 0 {
-            format!("{}: complete, {elided} elided", self.unit)
+        let invalid = self.invalid().count();
+        let mut counts = Vec::new();
+        if failed > 0 {
+            counts.push(format!("{failed} failed"));
+        }
+        if invalid > 0 {
+            counts.push(format!("{invalid} invalid"));
+        }
+        counts.push(format!("{elided} elided"));
+        let counts = counts.join(", ");
+        if self.is_faithful() {
+            format!("{}: complete, {counts}", self.unit)
         } else {
-            format!("{}: PARTIAL, {failed} failed, {elided} elided", self.unit)
+            format!("{}: PARTIAL, {counts}", self.unit)
         }
     }
 }
@@ -1887,9 +1966,11 @@ impl Translation {
 /// on, while the file stays on disk and will eventually be handed to the verifier
 /// by someone who didn't generate it. The file has to speak for itself.
 fn verdict_items(unit: &str, gaps: &[Gap]) -> Vec<Spanned<Item>> {
+    // Both blocking fidelities together: the header's job is to say whether the
+    // module may be verified, and neither may.
     let failures: Vec<&Gap> = gaps
         .iter()
-        .filter(|g| g.fidelity == Fidelity::Failed)
+        .filter(|g| g.fidelity != Fidelity::Elided)
         .collect();
     let elided = gaps.len() - failures.len();
 
