@@ -254,6 +254,90 @@ pub fn field_writer(ty: &ArgType) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// Whether an operand is stored in the stub's data area rather than encoded in
+/// the instruction.
+///
+/// It matters because the two sides of the generated C++ see a field
+/// differently: the writer method takes the value and writes it, while the
+/// compiler method receives a `uint32_t` *offset* into the stub data. The model
+/// takes the field on both sides, so the offset has no counterpart.
+///
+/// Keyed on the `Field` suffix, which is exactly the set: of the 50 arg types in
+/// `arg_reader_info`, the 18 read with `reader.stubOffset()` are precisely the 18
+/// whose names end in `Field`, with no exception in either direction.
+pub fn is_stub_field(ty: &ArgType) -> bool {
+    ty.as_str().ends_with("Field")
+}
+
+/// The `CacheIR::emitLoad*StubField` that reads a field into a register, the
+/// compiler-side counterpart of [`field_writer`].
+///
+/// One per field kind, because the C++ generic has no counterpart: Cachet has no
+/// overloading, so `emitLoadStubField`'s `switch` on `StubField::Type` had to
+/// become separate functions when the model was written.
+///
+/// Keyed on the Cachet field type, not the yaml's, because which loader applies
+/// is a fact about the model: `emitLoadInt32StubField` takes an `Int32Field`.
+/// [`translate_arg_type`] already owns the yaml-to-Cachet direction and is
+/// injective, so going through it loses nothing and leaves `RawInt32Field ->
+/// Int32Field` recorded in one place. [`field_writer`] stays on [`ArgType`] for
+/// the opposite reason: it answers what the generated *writer method* takes.
+pub fn field_loader(ty: &CachetPath) -> Option<&'static str> {
+    Some(match ty.to_string().as_str() {
+        // notes/cacheir.cachet:2154-2166.
+        "Int32Field" => "emitLoadInt32StubField",
+        "ValueField" => "emitLoadValueStubField",
+        "ObjectField" => "emitLoadObjectStubField",
+        _ => return None,
+    })
+}
+
+/// The `CacheIR::define*Id` that gives an operand id a register, keyed on the id
+/// type.
+///
+/// One per id type, again for want of overloading: C++ has the single
+/// `defineRegister`, which takes a `TypedOperandId` and reads the type back out
+/// of it, while each of these converts and calls the one uninterpreted
+/// `defineTypedId` (notes/cacheir.cachet:1919-1968).
+///
+/// A table and not a `define{ty}` rule so that it says what the model has:
+/// `IntPtrId` and a bare `OperandId` are absent because there is nothing to name.
+pub fn id_definer(ty: &CachetPath) -> Option<&'static str> {
+    Some(match ty.to_string().as_str() {
+        "ValueId" => "defineValueId",
+        "ObjectId" => "defineObjectId",
+        "Int32Id" => "defineInt32Id",
+        "NumberId" => "defineNumberId",
+        "BoolId" => "defineBoolId",
+        "StringId" => "defineStringId",
+        "SymbolId" => "defineSymbolId",
+        "BigIntId" => "defineBigIntId",
+        "ValueTagId" => "defineValueTagId",
+        _ => return None,
+    })
+}
+
+/// The `CacheIR::use*Id` that materializes an operand id into a register, keyed
+/// on the id type. The counterpart of [`id_definer`], and the same shape.
+///
+/// Where defining only reserves, using reads the operand's current location and
+/// may emit code to get it into a register, which is why these `emit MASM` and
+/// the definers do not (notes/cacheir.cachet:1992-2098).
+pub fn id_user(ty: &CachetPath) -> Option<&'static str> {
+    Some(match ty.to_string().as_str() {
+        "ValueId" => "useValueId",
+        "ObjectId" => "useObjectId",
+        "Int32Id" => "useInt32Id",
+        "NumberId" => "useNumberId",
+        "BoolId" => "useBoolId",
+        "StringId" => "useStringId",
+        "SymbolId" => "useSymbolId",
+        "BigIntId" => "useBigIntId",
+        "ValueTagId" => "useValueTagId",
+        _ => return None,
+    })
+}
+
 /// The type a *writer method* takes for an operand, which is not always the type
 /// the op takes.
 ///
@@ -295,7 +379,7 @@ const CACHET_KEYWORDS: &[&str] = &[
     "return", "right", "struct", "unsafe", "var",
 ];
 
-fn param_ident(name: &str) -> Ident {
+pub fn param_ident(name: &str) -> Ident {
     if CACHET_KEYWORDS.contains(&name) {
         Ident::from(format!("{name}_"))
     } else {
@@ -347,6 +431,44 @@ pub struct OpSig {
     pub params: Vec<CachetParam>,
 }
 
+/// A parameter of a generated Cachet item, as a readable name-and-type pair.
+///
+/// Emission needs a [`CachetParam`], but translating a body needs to *read* the
+/// signature, and a `CachetParam` is awkward to read back.
+#[derive(Clone, Debug)]
+pub struct SigParam {
+    /// The yaml's name after keyword mangling, so not always the yaml's name.
+    pub name: Ident,
+    pub ty: CachetPath,
+}
+
+impl SigParam {
+    /// The parameter as it is emitted. Operands are passed by value, so nothing
+    /// is written back.
+    pub fn to_param(&self) -> CachetParam {
+        CachetParam::Var(VarParam {
+            ident: Spanned::internal(self.name.clone()),
+            kind: VarParamKind::In,
+            type_: Spanned::internal(self.ty.clone()),
+        })
+    }
+}
+
+/// The op's parameters as [`op_sig`] binds them.
+///
+/// The same list `op_sig` emits, so the two cannot disagree about a name.
+pub fn op_params(op: &Op) -> Result<Vec<SigParam>, Unhandled> {
+    op.args
+        .iter()
+        .map(|(name, ty)| {
+            Ok(SigParam {
+                name: param_ident(name),
+                ty: translate_arg_type(ty)?,
+            })
+        })
+        .collect()
+}
+
 /// The wrapper an op needs to be usable as a value.
 ///
 /// `emit` is a statement, so an op that allocates a result cannot appear in an
@@ -360,11 +482,7 @@ pub struct HelperSig {
 }
 
 pub fn op_sig(op: &Op) -> Result<OpSig, Unhandled> {
-    let params = op
-        .args
-        .iter()
-        .map(|(name, ty)| Ok(param(name, translate_arg_type(ty)?)))
-        .collect::<Result<Vec<_>, Unhandled>>()?;
+    let params = op_params(op)?.iter().map(SigParam::to_param).collect();
     Ok(OpSig {
         path: op_path(op),
         params,

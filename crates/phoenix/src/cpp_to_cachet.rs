@@ -1,32 +1,35 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 
 use cachet_lang::ast::{
     BinOper, CompareBinOper, Ident, LogicalBinOper, Path as CachetPath, Spanned,
 };
-use cachet_lang::ast::{CheckKind, NegateKind, VarParamKind};
+use cachet_lang::ast::{CheckKind, NegateKind};
 use cachet_lang::parser::{
     FieldAccess,
     Arg, BinOperExpr, Block, Call, CallableItem, CheckStmt, Comment, ElseClause, Expr,
     GlobalVarItem,
     IfStmt as CachetIfStmt, ImportItem, IrItem, Item, LetStmt, Literal, LocalVar, Mod, NegateExpr,
-    Param as CachetParam, RetStmt, Stmt, VarParam,
+    RetStmt, Stmt,
 };
 use clang::{Entity, EntityKind};
 
 use crate::cacheir_ops::{
-    Op as CacheIrOp, Ops, create_op_wrapper, helper_sig, is_operand_id, op_path, writer_arity,
+    Op as CacheIrOp, Ops, SigParam, create_op_wrapper, field_loader, helper_sig, id_definer,
+    id_user, is_operand_id, is_stub_field, op_path, param_ident, translate_arg_type, writer_arity,
     writer_method,
 };
 use crate::cpp_subset::{
     Call as CppCall, Callee as CppCallee, Callees, CompoundStmt as CppCompoundStmt,
-    Construct as CppConstruct, Expr as CppExpr, FnDef, Indirection, Lit as CppLit,
+    Construct as CppConstruct, Expr as CppExpr, FnDef, Indirection, LetStmt as CppLetStmt,
+    Lit as CppLit,
     Error as SubsetError, FnId, FnRef, Param, RefKind, Span as CppSpan, Spanned as CppSpanned,
     Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
 };
 use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
 use crate::masm_ops::masm_call;
+use crate::scopes::Scopes;
 
 /// Whether leaving a construct out still leaves a model of the C++.
 ///
@@ -207,6 +210,13 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
 pub struct State {
     pub needed: Vec<Needed>,
     pub gaps: Vec<Gap>,
+    /// `StubFieldOffset` local -> the op field parameter it stands for: `val` ->
+    /// `val`. Recorded rather than matched against the next statement, so the
+    /// construction and its use need not be adjacent. Admits one use, as
+    /// `emitLoadStubField`'s argument.
+    stub_fields: HashMap<String, Ident>,
+    /// The locals in scope, for the facts a C++ type doesn't carry.
+    scopes: Scopes,
 }
 
 /// Something a translated body referred to that still has to be defined.
@@ -283,9 +293,14 @@ fn is_writer_expr(expr: &CppSpanned<CppExpr>) -> bool {
 /// `useValueRegister(masm, inputId)` does -- the argument is dropped.
 const AMBIENT: [[&str; 3]; 3] = [
     CACHE_IR_WRITER,
-    ["js", "jit", "CacheRegisterAllocator"],
+    ALLOCATOR,
     ["js", "jit", "StackMacroAssembler"],
 ];
+
+/// `js::jit::CacheRegisterAllocator`, which an instruction reaches registers
+/// through. The model holds no value for it, so its operations live on
+/// `ir CacheIR` instead.
+const ALLOCATOR: [&str; 3] = ["js", "jit", "CacheRegisterAllocator"];
 
 fn is_ambient_expr(expr: &CppSpanned<CppExpr>) -> bool {
     matches!(&expr.value, CppExpr::Ref(r) if AMBIENT.iter().any(|ty| r.ty.scope == *ty))
@@ -493,9 +508,60 @@ struct Ctx<'a> {
     class: Option<ClassRef>,
     /// `CacheIROps.yaml`, which decides what a `writer` call becomes.
     ops: &'a Ops,
+    /// The parameters of the C++ definition, and of the Cachet item it becomes.
+    ///
+    /// Both, because they disagree: the body is written against the first, the
+    /// signature is the second. An instruction's op says `result` where its
+    /// hand-written definition says `resultId` -- only the declaration in
+    /// `CacheIROpsGenerated.h` is generated from the yaml, so the definition is
+    /// free to spell its parameters however it likes.
+    cpp_sig: Option<Vec<Param>>,
+    cachet_sig: Option<Vec<SigParam>>,
+    /// The op being given meaning, when this is an instruction, and `None`
+    /// otherwise -- only [`translate_cacheir_op`] sets it.
+    instruction: Option<Instruction>,
+}
+
+/// What an instruction's body needs to know about the op it implements.
+#[derive(Clone, Debug)]
+struct Instruction {
+    /// The op's stub-field operands, keyed by the name the C++ gives the offset
+    /// it receives in their place.
+    ///
+    /// The yaml says `val: RawInt32Field` and the model's op takes that field;
+    /// the generated C++ takes `uint32_t valOffset`, since `arg_reader_info`
+    /// turns every field into a stub-data offset. The model has no notion of an
+    /// offset at all, so `valOffset` has no counterpart -- it is not renamed to
+    /// the field, it is eliminated, and the `StubFieldOffset` construction is
+    /// the only place that may consume it.
+    ///
+    /// Names only: the field's type is in [`Ctx::cachet_sig`] under the name this
+    /// maps to.
+    offsets: HashMap<String, Ident>,
 }
 
 impl Ctx<'_> {
+    /// The type the Cachet signature binds `name` at.
+    fn cachet_param_ty(&self, name: &Ident) -> Option<&CachetPath> {
+        let sig = self.cachet_sig.as_ref()?;
+        sig.iter().find(|p| &p.name == name).map(|p| &p.ty)
+    }
+
+    /// The Cachet parameter a C++ parameter became, found by position.
+    ///
+    /// Position is all that relates them, so this answers only when the two
+    /// signatures have the same length -- true of an instruction, whose
+    /// declaration is generated from the yaml the op's signature comes from, and
+    /// false of a generator, whose op takes no parameters at all.
+    fn cachet_param(&self, cpp_name: &str) -> Option<&SigParam> {
+        let (cpp, cachet) = (self.cpp_sig.as_ref()?, self.cachet_sig.as_ref()?);
+        if cpp.len() != cachet.len() {
+            return None;
+        }
+        let i = cpp.iter().position(|p| p.name == cpp_name)?;
+        cachet.get(i)
+    }
+
     /// Whether `this` is the CacheIR writer, which makes a call on an implicit
     /// receiver -- `guardToInt32_(input)` inside a wrapper -- a writer call.
     fn recv_is_writer(&self) -> bool {
@@ -558,10 +624,10 @@ fn translate_method(recv: &CppType, method: &str) -> Option<(&'static str, &'sta
         // Keyed on the C++ type, there being no Cachet type: an instruction
         // reaches registers *through* `allocator`, which the model holds no
         // value for, keeping those operations on `ir CacheIR` instead.
+        // `useValueRegister` and the rest of the register family are not here:
+        // their callee depends on the operand's id type, so they go through
+        // [`translate_allocator_register`] instead.
         ("js::jit::CacheRegisterAllocator", _, "knownType") => Some(("CacheIR", "knownType")),
-        ("js::jit::CacheRegisterAllocator", _, "useValueRegister") => {
-            Some(("CacheIR", "useValueId"))
-        }
 
         _ => None,
     }
@@ -701,6 +767,36 @@ fn translate_retype(
     }))
 }
 
+/// The local a `StubFieldOffset` construction binds, and the op field it stands
+/// for, if this declaration is one.
+///
+/// Matched narrowly: the construction has to name an offset parameter of the op
+/// being translated. Anything else built from a `StubFieldOffset` is refused,
+/// there being nothing in the model to stand for it.
+fn stub_field_binding(ctx: &Ctx<'_>, l: &CppLetStmt) -> Option<(String, Ident)> {
+    let instruction = ctx.instruction.as_ref()?;
+    let init = l.init.as_ref()?;
+    let CppExpr::Construct(c) = &init.value else {
+        return None;
+    };
+    if c.ty.scope != ["js", "jit", "StubFieldOffset"] {
+        return None;
+    }
+    let CppExpr::Ref(offset) = &c.args.first()?.value else {
+        return None;
+    };
+    let field = instruction.offsets.get(&offset.name)?;
+    Some((l.name.clone(), field.clone()))
+}
+
+/// `emitLoadStubField(..)` on the compiler's implicit `this`.
+fn is_load_stub_field(call: &CppCall) -> bool {
+    matches!(
+        &call.callee,
+        CppCallee::Method { recv: None, callee } if callee.name == "emitLoadStubField"
+    )
+}
+
 /// `trackAttached(..)` on a generator's implicit `this`.
 fn is_track_attached(call: &CppCall) -> bool {
     matches!(
@@ -746,6 +842,105 @@ fn named_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
 /// pattern.
 fn translate_known_expr(expr: &CppSpanned<CppExpr>) -> Option<Expr> {
     translate_failure_label(expr)
+}
+
+/// `allocator.defineRegister(masm, resultId)` is `CacheIR::defineInt32Id(resultId)`,
+/// and `useRegister` is `use*Id` the same way.
+///
+/// The callee depends on the *argument's* id type, which no table keyed on the
+/// receiver and the method name can express: C++ carries the operand's type as a
+/// value -- these take a `TypedOperandId` and read `typedId.type()` back out of it
+/// -- where the model, having no overloading, carries it in the name.
+/// [`id_definer`] and [`id_user`] hold the correspondence; this finds the argument
+/// to key them on.
+///
+/// The `*ValueRegister` spellings join their families: `ValueId` is the one id that
+/// is not a `TypedOperandId`, so C++ needs a second name for it where the model
+/// does not.
+///
+/// Note what the model drops on the defining side: `defineRegister` also allocates
+/// a physical register, possibly spilling, and asserts both that the slot was still
+/// undefined and that no failure path has been added yet. `defineTypedId` has no
+/// body, so none of that is checked. `useTypedId` does have one.
+/// Only reached as a declaration's initializer, so the register it yields always
+/// gets a name to record against. Of the 522 `allocator.use*`/`define*` calls in
+/// `CacheIRCompiler.cpp` that is all but 8, and those 8 are
+/// `mozilla::Maybe::emplace`, an idiom outside the subset anyway.
+fn translate_allocator_register(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    expr: &CppSpanned<CppExpr>,
+) -> Result<(Expr, CachetPath), Unhandled> {
+    let (family, callee, args) = allocator_register(expr)
+        .ok_or_else(|| Unhandled::new(String::from("not a register from `allocator`")))?;
+
+    // `masm` is ambient, leaving the operand id as the only argument that is a
+    // value in the model.
+    let mut operands = args.iter().filter(|arg| !is_ambient_expr(arg));
+    let (Some(id), None) = (operands.next(), operands.next()) else {
+        return Err(Unhandled::new(format!(
+            "`{}` takes one operand id besides `masm`",
+            callee.name
+        )));
+    };
+
+    let id_ty = translate_type(operand_type(id)?)?;
+    let target = family(&id_ty)
+        .ok_or_else(|| Unhandled::new(format!("no `{}` of a `{id_ty}` in the model", callee.name)))?;
+    let call = Expr::Invoke(Call {
+        target: Spanned::internal(
+            CachetPath::from_ident("CacheIR").nest(Ident::from(target.to_owned())),
+        ),
+        args: Spanned::internal(vec![Spanned::internal(Arg::Expr(translate_expr(
+            ctx, state, id,
+        )?))]),
+    });
+    Ok((call, id_ty))
+}
+
+/// The `CacheIR` family a call on `allocator` belongs to, with the callee and its
+/// arguments. Syntax only, so it can guard a match arm without translating.
+fn allocator_register<'e>(
+    expr: &'e CppSpanned<CppExpr>,
+) -> Option<(
+    fn(&CachetPath) -> Option<&'static str>,
+    &'e FnRef,
+    &'e [CppSpanned<CppExpr>],
+)> {
+    let CppExpr::Call(call) = &expr.value else {
+        return None;
+    };
+    let CppCallee::Method {
+        recv: Some(recv),
+        callee,
+    } = &call.callee
+    else {
+        return None;
+    };
+    if named_type(recv).ok()?.scope != ALLOCATOR {
+        return None;
+    }
+    let family: fn(&CachetPath) -> Option<&'static str> = match callee.name.as_str() {
+        "defineRegister" | "defineValueRegister" => id_definer,
+        "useRegister" | "useValueRegister" => id_user,
+        _ => return None,
+    };
+    Some((family, callee, &call.args))
+}
+
+/// The C++ type of an operand argument.
+///
+/// Unlike a receiver, which has to be a name, an operand is often a retyping --
+/// `useRegister(masm, BooleanOperandId(inputId.id()))` -- so a construction
+/// carries a type here too.
+fn operand_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
+    match &expr.value {
+        CppExpr::Ref(r) => Ok(&r.ty),
+        CppExpr::Construct(c) => Ok(&c.ty),
+        _ => Err(Unhandled::new(String::from(
+            "operand is neither a name nor a construction",
+        ))),
+    }
 }
 
 /// `failure->label()` is the field access `failure.label_`.
@@ -811,6 +1006,46 @@ fn translate_expr_value(
     }
     match &expr.value {
         CppExpr::Ref(r) => match r.kind {
+            // An instruction's offset parameter, which stands for a field the
+            // model already has typed. The model has no notion of an offset, so
+            // there is nothing to translate this to; the `StubFieldOffset`
+            // construction consumes it, and any other use is refused.
+            RefKind::Param
+                if ctx
+                    .instruction
+                    .as_ref()
+                    .is_some_and(|i| i.offsets.contains_key(&r.name)) =>
+            {
+                Err(Unhandled::new(format!(
+                    "stub field offset `{}`: the model has no offsets",
+                    r.name
+                )))
+            }
+            // A local standing for a dropped `StubFieldOffset` construction.
+            // Its only legitimate use is as `emitLoadStubField`'s first
+            // argument, which reads the name directly rather than translating
+            // it, so reaching here means the C++ used the offset for something
+            // the model can't express.
+            //
+            // Letting it through would be worse than dangling: the op's field
+            // parameter often carries the very same name the C++ gave the local
+            // -- `val` in `LoadInt32Constant` -- so the reference would
+            // silently resolve to the field itself and type check.
+            RefKind::Local if state.stub_fields.contains_key(&r.name) => {
+                Err(Unhandled::new(format!(
+                    "stub field offset `{}`: the model has no offsets",
+                    r.name
+                )))
+            }
+            // A parameter the generated signature binds under another name, the
+            // two being written independently: the yaml says `result` where the
+            // definition says `resultId`.
+            RefKind::Param if ctx.cachet_param(&r.name).is_some() => {
+                let param = ctx.cachet_param(&r.name).unwrap();
+                Ok(Expr::Var(Spanned::internal(CachetPath::from_ident(
+                    param.name.clone(),
+                ))))
+            }
             // In scope in the translated body, so the name carries over as it is.
             RefKind::Param | RefKind::Local => Ok(Expr::Var(Spanned::internal(
                 CachetPath::from_ident(Ident::from(r.name.clone())),
@@ -1051,6 +1286,45 @@ fn translate_stmt_values(
         }))]),
         // Cachet's `let` always binds a value, so a C++ declaration without an
         // initializer -- `Label done;` -- has no counterpart.
+        // `StubFieldOffset val(valOffset, StubField::Type::RawInt32);` pairs the
+        // offset with the kind the C++ lost. The model never lost it -- the op's
+        // parameter is already an `Int32Field` -- so the construction says
+        // nothing and is dropped, leaving `val` standing for that parameter.
+        //
+        // Ahead of the ordinary declaration arm, which would otherwise claim it.
+        CppStmt::Let(l) if stub_field_binding(ctx, l).is_some() => {
+            let (local, field) = stub_field_binding(ctx, l).unwrap();
+            state.stub_fields.insert(local, field);
+            state.gaps.push(Gap {
+                fidelity: Fidelity::Elided,
+                what: String::from("StubFieldOffset"),
+                span: stmt.span.clone(),
+            });
+            Ok(Vec::new())
+        }
+
+        // `Register output = allocator.defineRegister(masm, resultId);` binds a
+        // register, and the operand id it came from is the only record of what kind
+        // of value it holds -- a fact the C++ `Register` type does not carry and
+        // that later masm calls need.
+        CppStmt::Let(l)
+            if l.init
+                .as_ref()
+                .is_some_and(|init| allocator_register(init).is_some()) =>
+        {
+            let init = l.init.as_ref().unwrap();
+            let (rhs, id_ty) = translate_allocator_register(ctx, state, init)?;
+            state.scopes.insert_register(l.name.clone(), id_ty);
+            Ok(vec![Spanned::internal(Stmt::Let(LetStmt {
+                lhs: LocalVar {
+                    ident: Spanned::internal(Ident::from(l.name.clone())),
+                    is_mut: false,
+                    type_: None,
+                },
+                rhs: Spanned::internal(rhs),
+            }))])
+        }
+
         CppStmt::Let(l) => {
             let init = l.init.as_ref().ok_or_else(|| {
                 Unhandled::new(format!("declaration of `{}` without an initializer", l.name))
@@ -1105,6 +1379,46 @@ fn translate_stmt_values(
                 args: Spanned::internal(args),
             }))])
         }
+        // `emitLoadStubField(val, reg)` reads the field into a register. The C++
+        // is generic and switches on the kind; the model has one function per
+        // kind, Cachet having no overloading, so the kind recorded above picks it.
+        CppStmt::Expr(CppExpr::Call(call)) if is_load_stub_field(call) => {
+            let [field, dst] = call.args.as_slice() else {
+                return Err(Unhandled::new(format!(
+                    "`emitLoadStubField` takes 2 arguments, called with {}",
+                    call.args.len()
+                )));
+            };
+            let CppExpr::Ref(r) = &field.value else {
+                return Err(Unhandled::new(String::from(
+                    "`emitLoadStubField`: first argument is not a name",
+                )));
+            };
+            let field = state.stub_fields.get(&r.name).cloned().ok_or_else(|| {
+                Unhandled::new(format!(
+                    "`emitLoadStubField`: `{}` is not a known stub field",
+                    r.name
+                ))
+            })?;
+            let ty = ctx.cachet_param_ty(&field).ok_or_else(|| {
+                Unhandled::new(format!("`{field}` is not an operand of the op"))
+            })?;
+            let loader = field_loader(ty)
+                .ok_or_else(|| Unhandled::new(format!("no loader for a `{ty}` in the model")))?;
+
+            Ok(vec![Spanned::internal(Stmt::Expr(Expr::Invoke(Call {
+                target: Spanned::internal(
+                    CachetPath::from_ident("CacheIR").nest(Ident::from(loader.to_owned())),
+                ),
+                args: Spanned::internal(vec![
+                    Spanned::internal(Arg::Expr(Expr::Var(Spanned::internal(
+                        CachetPath::from_ident(field),
+                    )))),
+                    Spanned::internal(Arg::Expr(translate_expr(ctx, state, dst)?)),
+                ]),
+            })))])
+        }
+
         CppStmt::Expr(CppExpr::Call(call)) if dropped_call(ctx, call).is_some() => {
             // Recorded even though nothing is emitted, so the tally of what the
             // module leaves out stays complete.
@@ -1118,22 +1432,28 @@ fn translate_stmt_values(
         // `masm.branchTestNull(..)` emits machine code, which Cachet spells
         // `emit MASM::BranchTestNull(..)`. The receiver is ambient, so only the
         // arguments carry over.
-        CppStmt::Expr(CppExpr::Call(_)) if masm_call(&stmt.value).is_some() => {
-            let (op, args) = masm_call(&stmt.value).unwrap();
-            let args = args
-                .iter()
-                .map(|arg| {
-                    Ok(Spanned::internal(Arg::Expr(translate_expr(
-                        ctx, state, arg,
-                    )?)))
-                })
-                .collect::<Result<Vec<_>, Unhandled>>()?;
-            Ok(vec![Spanned::internal(Stmt::Emit(Call {
-                target: Spanned::internal(
-                    CachetPath::from_ident("MASM").nest(Ident::from(op.to_owned())),
-                ),
-                args: Spanned::internal(args),
-            }))])
+        CppStmt::Expr(CppExpr::Call(_)) if masm_call(&stmt.value, &state.scopes).is_some() => {
+            // One call can mean several ops, so this is a loop: see `masm_call`.
+            let emits = masm_call(&stmt.value, &state.scopes).unwrap();
+            let mut stmts = Vec::new();
+            for emit in emits {
+                let args = emit
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        Ok(Spanned::internal(Arg::Expr(translate_expr(
+                            ctx, state, arg,
+                        )?)))
+                    })
+                    .collect::<Result<Vec<_>, Unhandled>>()?;
+                stmts.push(Spanned::internal(Stmt::Emit(Call {
+                    target: Spanned::internal(
+                        CachetPath::from_ident("MASM").nest(Ident::from(emit.op.to_owned())),
+                    ),
+                    args: Spanned::internal(args),
+                })));
+            }
+            Ok(stmts)
         }
         CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
     }
@@ -1305,6 +1625,19 @@ fn translate_block(
     state: &mut State,
     body: &CppCompoundStmt,
 ) -> Result<Block, Unhandled> {
+    // A C++ declaration is scoped to its block, so what the walk learns about a
+    // local has to go out of scope with it.
+    state.scopes.push();
+    let block = translate_block_stmts(ctx, state, body);
+    state.scopes.pop();
+    block
+}
+
+fn translate_block_stmts(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    body: &CppCompoundStmt,
+) -> Result<Block, Unhandled> {
     let mut stmts = Vec::new();
     let mut rest = body.stmts.as_slice();
     while let [stmt, tail @ ..] = rest {
@@ -1356,9 +1689,32 @@ pub fn translate_fn_def(
     class: Option<ClassRef>,
     fn_def: &FnDef,
 ) -> Result<(CallableItem, State), Unhandled> {
+    // The writer is ambient, so it is dropped rather than translated; the rest
+    // keep their C++ names, a helper having no second source of names to
+    // reconcile against.
+    let sig = fn_def
+        .params
+        .iter()
+        .filter(|param| !is_writer(&param.ty))
+        .map(|param| {
+            Ok(SigParam {
+                name: Ident::from(param.name.clone()),
+                ty: translate_type(&param.ty).map_err(|e| {
+                    Unhandled::new(format!("parameter `{}`: {}", param.name, e.what))
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, Unhandled>>()?;
+
     // A helper is top-level, so it has no parent to qualify names against.
     // `state` is created here and returned: its scope is this one definition.
-    let ctx = Ctx { class, ops };
+    let ctx = Ctx {
+        class,
+        ops,
+        cpp_sig: Some(fn_def.params.clone()),
+        cachet_sig: Some(sig.clone()),
+        instruction: None,
+    };
 
     // Taking a writer is what makes a function emit, so dropping the parameter
     // is what the `emits` clause replaces. A `CacheIRWriter` method takes no
@@ -1366,22 +1722,7 @@ pub fn translate_fn_def(
     let emits = (ctx.recv_is_writer() || fn_def.params.iter().any(|param| is_writer(&param.ty)))
         .then(|| Spanned::internal(CachetPath::from_ident("CacheIR")));
 
-    let params = fn_def
-        .params
-        .iter()
-        .filter(|param| !is_writer(&param.ty))
-        .map(|param| {
-            let type_ = translate_type(&param.ty)
-                .map_err(|e| Unhandled::new(format!("parameter `{}`: {}", param.name, e.what)))?;
-            Ok(CachetParam::Var(VarParam {
-                ident: Spanned::internal(Ident::from(param.name.clone())),
-                // C++ passes these by value or by const reference, so nothing
-                // is written back.
-                kind: VarParamKind::In,
-                type_: Spanned::internal(type_),
-            }))
-        })
-        .collect::<Result<Vec<_>, Unhandled>>()?;
+    let params = sig.iter().map(SigParam::to_param).collect();
 
     let ret =
         translate_type(&fn_def.ret).map_err(|e| Unhandled::new(format!("return type: {}", e.what)))?;
@@ -1459,6 +1800,13 @@ pub fn translate_gen_def(
     let ctx = Ctx {
         class: Some(gen_def.class.clone()),
         ops,
+        cpp_sig: Some(gen_def.def.params.clone()),
+        // The generator's op takes nothing: its `ValOperandId` parameters become
+        // `defineInputValueId()` bindings in the body, under the very names the
+        // C++ gave the parameters. So the lists have nothing to say to each
+        // other here, and the differing arity is what keeps them apart.
+        cachet_sig: Some(Vec::new()),
+        instruction: None,
     };
 
     // The `ir` is named after the class, so it has to be a class we know is a
@@ -1803,6 +2151,106 @@ pub fn translate_fn_and_transitive_callees<'tu>(
     let (mut items, gaps) = translate_transitive_callees(ops, fn_def.callees, state, seen);
     items.push(Spanned::internal(Item::Fn(item)));
     Ok((items, gaps))
+}
+
+/// A `CacheIRCompiler::emit*` method as the `op` it gives meaning to.
+///
+/// The signature comes from `CacheIROps.yaml`, not from the C++. It has to: the
+/// C++ parameters are generated from the yaml by `GenerateCacheIRFiles.py`, and
+/// generating them *loses* information, since `arg_reader_info` turns every
+/// field kind into a bare `uint32_t` offset -- `RawInt32Field`,
+/// `RawPointerField`, `ICScriptField` and `IdField` all arrive as `uint32_t`.
+/// The yaml still has the distinction, so it is read rather than reconstructed.
+///
+/// The op sits in `ir CacheIR`, which is what says `emits MASM`, so the op
+/// itself declares neither that nor a return.
+///
+/// Scaffolding: the signature only. Reconciling it with the body -- whose
+/// statements refer to the C++ parameter names, `valOffset` where the yaml says
+/// `val` -- comes next.
+pub fn translate_cacheir_op(
+    instruction: &Entity<'_>,
+) -> Result<(CallableItem, Vec<Gap>), Error> {
+    let ops = load_ops()?;
+    let method = get_method_def(instruction)?;
+
+    let name = method
+        .def
+        .name
+        .name
+        .strip_prefix("emit")
+        .ok_or_else(|| {
+            Unhandled::new(format!(
+                "`{}`: an instruction is named `emit<Op>`",
+                method.def.name.name
+            ))
+        })?
+        .to_owned();
+    let op = ops.get(&name).ok_or_else(|| {
+        Unhandled::new(format!("no op `{name}` in CacheIROps.yaml"))
+    })?;
+
+    // The declaration in `CacheIROpsGenerated.h` is generated from the yaml args
+    // in order, and the definition implements that declaration, so the two lists
+    // correspond position by position.
+    if op.args.len() != method.def.params.len() {
+        return Err(Unhandled::new(format!(
+            "`{name}`: the yaml gives {} operand(s), the definition takes {}",
+            op.args.len(),
+            method.def.params.len()
+        ))
+        .into());
+    }
+
+    // Types from the yaml, which is where a field is a field rather than an
+    // offset. Names from the C++, so the body refers to its parameters as it
+    // already does and cannot come to shadow them -- except a field's, the one
+    // operand whose meaning changes, and which it would be a lie to call
+    // `valOffset`.
+    let sig = op
+        .args
+        .iter()
+        .zip(&method.def.params)
+        .map(|((arg, ty), param)| {
+            Ok(SigParam {
+                name: param_ident(if is_stub_field(ty) { arg } else { &param.name }),
+                ty: translate_arg_type(ty)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Unhandled>>()?;
+
+    let offsets = op
+        .args
+        .iter()
+        .zip(&sig)
+        .zip(&method.def.params)
+        .filter(|(((_, ty), _), _)| is_stub_field(ty))
+        .map(|((_, arg), param)| (param.name.clone(), arg.name.clone()))
+        .collect();
+
+    let ctx = Ctx {
+        class: Some(method.class.clone()),
+        ops: &ops,
+        cpp_sig: Some(method.def.params.clone()),
+        cachet_sig: Some(sig.clone()),
+        instruction: Some(Instruction { offsets }),
+    };
+    let mut state = State::default();
+    let body = translate_block(&ctx, &mut state, &method.def.body)?;
+
+    Ok((
+        CallableItem {
+            ident: Spanned::internal(Ident::from(name)),
+            attrs: Vec::new(),
+            is_unsafe: false,
+            params: sig.iter().map(SigParam::to_param).collect(),
+            // Both are the enclosing `ir CacheIR`'s to declare.
+            emits: None,
+            ret: None,
+            body: Spanned::internal(Some(body)),
+        },
+        state.gaps,
+    ))
 }
 
 pub fn translate_generator(

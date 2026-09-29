@@ -239,6 +239,9 @@ enum Unit {
     /// A method translated as a top-level `fn`, its class deciding what is
     /// ambient -- a `CacheIRWriter` wrapper being the case that works today.
     Method,
+    /// A `CacheIRCompiler::emit*` method, which becomes an `op` in `ir CacheIR`
+    /// whose signature comes from `CacheIROps.yaml` rather than from the C++.
+    Instruction,
 }
 
 #[derive(Subcommand)]
@@ -332,7 +335,19 @@ fn main() {
             unit,
             ..
         } => {
-            if *unit != Unit::Generator {
+            if *unit == Unit::Instruction {
+                match phoenix::cpp_to_cachet::translate_cacheir_op(&def) {
+                    Ok((op, gaps)) => {
+                        let item = cachet_lang::parser::Item::Op(op);
+                        write_out(out.as_deref(), &format!("{item}\n"));
+                        report_gaps(symbol, &gaps);
+                    }
+                    Err(e) => {
+                        eprintln!("cannot translate {symbol}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else if *unit != Unit::Generator {
                 // A free function has no class, so nothing is ambient; a method
                 // carries its class, which decides what is.
                 let translated = phoenix::cpp_to_cachet::load_ops()
