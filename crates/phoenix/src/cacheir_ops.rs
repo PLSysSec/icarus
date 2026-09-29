@@ -17,6 +17,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::cpp_to_cachet::Unhandled;
+use crate::names::is_reserved;
 
 /// The name of an op argument's type, e.g. `ValId`, `RawInt32Field`, `JSOpImm`.
 ///
@@ -373,14 +374,14 @@ fn id_allocator(ty: &CachetPath) -> Option<&'static str> {
 
 /// Cachet's keywords, which an operand can't be named after. Only `op` collides
 /// today; the hand-written models call that operand `jsop`.
-const CACHET_KEYWORDS: &[&str] = &[
-    "as", "asc", "assert", "assume", "bind", "desc", "else", "emit", "emits", "enum", "fn", "for",
-    "goto", "if", "impl", "import", "in", "ir", "label", "left", "let", "mut", "op", "out",
-    "return", "right", "struct", "unsafe", "var",
-];
-
+/// A yaml operand name as a Cachet identifier.
+///
+/// Collision-blind, unlike [`NameMap`](crate::names::NameMap): an op's operands are
+/// named by the yaml and cannot clash with each other. Where the body's own names
+/// are in play -- an instruction, whose parameters come from the C++ -- the map is
+/// what decides.
 pub fn param_ident(name: &str) -> Ident {
-    if CACHET_KEYWORDS.contains(&name) {
+    if is_reserved(name) {
         Ident::from(format!("{name}_"))
     } else {
         Ident::from(name.to_owned())

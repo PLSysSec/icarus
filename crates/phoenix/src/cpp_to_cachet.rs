@@ -10,25 +10,27 @@ use cachet_lang::parser::{
     FieldAccess,
     Arg, BinOperExpr, Block, Call, CallableItem, CheckStmt, Comment, ElseClause, Expr,
     GlobalVarItem,
-    IfStmt as CachetIfStmt, ImportItem, IrItem, Item, LetStmt, Literal, LocalVar, Mod, NegateExpr,
+    IfStmt as CachetIfStmt, ImportItem, IrItem, Item, Label as CachetLabel, LabelStmt, LetStmt,
+    Literal, LocalVar, Mod, NegateExpr,
     RetStmt, Stmt,
 };
 use clang::{Entity, EntityKind};
 
 use crate::cacheir_ops::{
     Op as CacheIrOp, Ops, SigParam, create_op_wrapper, field_loader, helper_sig, id_definer,
-    id_user, is_operand_id, is_stub_field, op_path, param_ident, translate_arg_type, writer_arity,
+    id_user, is_operand_id, is_stub_field, op_path, translate_arg_type, writer_arity,
     writer_method,
 };
 use crate::cpp_subset::{
     Call as CppCall, Callee as CppCallee, Callees, CompoundStmt as CppCompoundStmt,
-    Construct as CppConstruct, Expr as CppExpr, FnDef, Indirection, LetStmt as CppLetStmt,
-    Lit as CppLit,
+    Construct as CppConstruct, Expr as CppExpr, FnDef, IfStmt as CppIfStmt, Indirection,
+    LetStmt as CppLetStmt, Lit as CppLit,
     Error as SubsetError, FnId, FnRef, Param, RefKind, Span as CppSpan, Spanned as CppSpanned,
     Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
 };
 use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
-use crate::masm_ops::masm_call;
+use crate::masm_ops::{LABEL, masm_call};
+use crate::names::{NameMap, declared_names};
 use crate::scopes::{Obligation, Scopes};
 
 /// Whether leaving a construct out still leaves a model of the C++.
@@ -71,7 +73,11 @@ impl fmt::Display for Gap {
     }
 }
 
-/// A C++ construct with no Cachet counterpart yet.
+/// A construct that reached the modeled C++ subset but has no Cachet counterpart.
+///
+/// The second of the two ways translation can stop. An
+/// [`Unsupported`](crate::cpp_subset::Unsupported) means the C++ never got as far
+/// as the subset; this means it did, and the model has nothing to say it with.
 ///
 /// Translation refuses rather than guesses: a type mapped wrongly would verify
 /// something other than the code that runs, which is worse than not verifying.
@@ -205,6 +211,14 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         // `bool` against Cachet's `Bool`.
         (["bool"], []) => Ok(CachetPath::from_ident("Bool")),
 
+        // The condition a branch tests (notes/masm.cachet:575). Matched on the
+        // trailing name because the path is platform-dependent: `Assembler::
+        // Condition` is a typedef, canonically `vixl::Condition` on arm64 and an
+        // enum in `js::jit` on x86 -- the same split that makes its *constants*
+        // globals on one and enumerators on the other (see
+        // [`translate_enum_const`]).
+        ([.., "Condition"], []) => Ok(CachetPath::from_ident("Condition")),
+
         // The register a boxed value lives in (RegisterSets.h:201 -- "Registers
         // to hold a boxed value"), which the model calls `ValueReg`
         // (notes/masm.cachet:65).
@@ -317,6 +331,17 @@ const AMBIENT: [[&str; 3]; 3] = [
 /// through. The model holds no value for it, so its operations live on
 /// `ir CacheIR` instead.
 const ALLOCATOR: [&str; 3] = ["js", "jit", "CacheRegisterAllocator"];
+
+/// `js::jit::AutoOutputRegister`, which reserves the register an instruction's
+/// result goes into and releases it on the way out.
+///
+/// The model has the register -- `var outputReg: TypedOrValueReg` -- but not the
+/// reservation: `allocateReg` and `isAllocatedReg` are uninterpreted and
+/// `releaseReg` has no body, so the whole allocator is unmodeled (a refinement
+/// that would have tracked it is commented out, notes/cacheir.cachet:2196-2223).
+/// So the declaration is dropped and the local denotes the register, which is what
+/// `operator TypedOrValueRegister()` makes it mean anyway.
+const AUTO_OUTPUT_REGISTER: [&str; 3] = ["js", "jit", "AutoOutputRegister"];
 
 fn is_ambient_expr(expr: &CppSpanned<CppExpr>) -> bool {
     matches!(&expr.value, CppExpr::Ref(r) if AMBIENT.iter().any(|ty| r.ty.scope == *ty))
@@ -533,6 +558,10 @@ struct Ctx<'a> {
     /// free to spell its parameters however it likes.
     cpp_sig: Option<Vec<Param>>,
     cachet_sig: Option<Vec<SigParam>>,
+    /// What each name the unit declares is called in Cachet, which is the C++ name
+    /// unless it is a Cachet keyword. Decided for the whole unit at once so a
+    /// mangled name cannot land on one already in use.
+    names: NameMap,
     /// The op being given meaning, when this is an instruction, and `None`
     /// otherwise -- only [`translate_cacheir_op`] sets it.
     instruction: Option<Instruction>,
@@ -666,7 +695,7 @@ fn translate_method(recv: &CppType, method: &str) -> Option<(&'static str, &'sta
 /// one and a global on the other, with different scopes, for one Cachet target.
 /// Two `Condition` types in different namespaces would collide here; within the
 /// JIT there is only the one.
-fn translate_enum_const(ty: &str, name: &str) -> Option<(&'static str, &'static str)> {
+fn translate_enum_const<'n>(ty: &str, name: &'n str) -> Option<(&'static str, &'n str)> {
     match (ty, name) {
         // `enum JSValueType` (notes/js.cachet:349) against Value.h:158. The two
         // agree variant for variant, in the same order.
@@ -685,9 +714,16 @@ fn translate_enum_const(ty: &str, name: &str) -> Option<(&'static str, &'static 
         ("JSValueType", "JSVAL_TYPE_OBJECT") => Some(("JSValueType", "Object")),
         ("JSValueType", "JSVAL_TYPE_UNKNOWN") => Some(("JSValueType", "Unknown")),
 
-        // `enum Condition` (notes/masm.cachet) against the assembler's, whose
-        // names it keeps.
-        ("Condition", "NotEqual") => Some(("Condition", "NotEqual")),
+        // `enum JSOp` (notes/jsop.cachet) and `enum Condition` (notes/masm.cachet)
+        // keep the engine's variant names, so a constant passes through by name.
+        //
+        // A rule rather than a table because the model declares 227 of the engine's
+        // 257 opcodes -- too many to list -- and it is safe here where it was not
+        // for a bare global: a variant is qualified by its enum, so an unmodeled one
+        // cannot bind to something else. Cachet refuses it outright, "undefined
+        // variable `JSOp::NotARealOpcode`", which makes a miss loud.
+        ("JSOp", name) => Some(("JSOp", name)),
+        ("Condition", name) => Some(("Condition", name)),
 
         _ => None,
     }
@@ -805,6 +841,24 @@ fn stub_field_binding(ctx: &Ctx<'_>, l: &CppLetStmt) -> Option<(String, Ident)> 
     Some((l.name.clone(), field.clone()))
 }
 
+/// `Label ifTrue;` -- a default-constructed `js::jit::Label`. The C++ declares it
+/// to take its address later; the model declares it to `bind` and `goto` it.
+fn is_label_decl(l: &CppLetStmt) -> bool {
+    matches!(
+        l.init.as_ref().map(|init| &init.value),
+        Some(CppExpr::Construct(c)) if c.ty.scope == LABEL && c.args.is_empty()
+    )
+}
+
+/// `AutoOutputRegister output(*this);` -- the declaration whose only effect is the
+/// reservation the model does without.
+fn is_output_register_decl(l: &CppLetStmt) -> bool {
+    matches!(
+        l.init.as_ref().map(|init| &init.value),
+        Some(CppExpr::Construct(c)) if c.ty.scope == AUTO_OUTPUT_REGISTER
+    )
+}
+
 /// `emitLoadStubField(..)` on the compiler's implicit `this`.
 fn is_load_stub_field(call: &CppCall) -> bool {
     matches!(
@@ -856,8 +910,45 @@ fn named_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
 /// same reason: the tables map a call to a call and a name to a name, so an
 /// idiom that crosses those categories has nowhere to live. One helper per
 /// pattern.
-fn translate_known_expr(expr: &CppSpanned<CppExpr>) -> Option<Expr> {
-    translate_failure_label(expr)
+fn translate_known_expr(ctx: &Ctx<'_>, expr: &CppSpanned<CppExpr>) -> Option<Expr> {
+    if let Some(label) = translate_failure_label(ctx, expr) {
+        return Some(label);
+    }
+    if let Some(label) = translate_label_ref(ctx, expr) {
+        return Some(label);
+    }
+    None
+}
+
+/// `&ifTrue` is the label `ifTrue`.
+///
+/// C++ passes a label by address because masm records patch sites in it; the model
+/// passes it by name, a label not being a value there. So the `&` has no
+/// counterpart and is dropped.
+///
+/// Narrowly, though: only for a label. An address of anything else is either an
+/// out-parameter -- which Cachet spells `out`, and where dropping the `&` would
+/// lose the write with nothing to notice it -- or aliasing the model has no
+/// counterpart for. Telling those apart needs the callee's parameter constness,
+/// which is not extracted, so they stay refused.
+fn translate_label_ref(ctx: &Ctx<'_>, expr: &CppSpanned<CppExpr>) -> Option<Expr> {
+    let CppExpr::Unary(u) = &expr.value else {
+        return None;
+    };
+    if u.op != "&" {
+        return None;
+    }
+    let CppExpr::Ref(r) = &u.operand.value else {
+        return None;
+    };
+    if r.ty.scope != LABEL {
+        return None;
+    }
+    // A bare name in argument position, which the parser resolves to a label or a
+    // variable (grammar.lalrpop:181) -- the same route `failure.label_` takes.
+    Some(Expr::Var(Spanned::internal(CachetPath::from_ident(
+        ctx.names.ident(&r.name),
+    ))))
 }
 
 /// `allocator.defineRegister(masm, resultId)` is `CacheIR::defineInt32Id(resultId)`,
@@ -970,7 +1061,7 @@ fn operand_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
 /// failure.label_;` is rejected -- but that distinction is the parser's to make,
 /// since it rewrites a field access in argument position into a label-or-variable
 /// argument (grammar.lalrpop:181). Emitting the field access is enough.
-fn translate_failure_label(expr: &CppSpanned<CppExpr>) -> Option<Expr> {
+fn translate_failure_label(ctx: &Ctx<'_>, expr: &CppSpanned<CppExpr>) -> Option<Expr> {
     let CppExpr::Call(call) = &expr.value else {
         return None;
     };
@@ -993,7 +1084,7 @@ fn translate_failure_label(expr: &CppSpanned<CppExpr>) -> Option<Expr> {
 
     Some(Expr::from(FieldAccess {
         parent: Spanned::internal(Expr::Var(Spanned::internal(CachetPath::from_ident(
-            Ident::from(r.name.clone()),
+            ctx.names.ident(&r.name),
         )))),
         field: Spanned::internal(Ident::from("label_")),
     }))
@@ -1017,10 +1108,17 @@ fn translate_expr_value(
     state: &mut State,
     expr: &CppSpanned<CppExpr>,
 ) -> Result<Expr, Unhandled> {
-    if let Some(known) = translate_known_expr(expr) {
+    if let Some(known) = translate_known_expr(ctx, expr) {
         return Ok(known);
     }
     match &expr.value {
+        // `output` is the result register: C++ reaches it through an
+        // `AutoOutputRegister` that converts to the register implicitly, the model
+        // through a `var`. Keyed on the type, which is the whole fact -- no
+        // bookkeeping needed, unlike the `StubFieldOffset` locals below.
+        CppExpr::Ref(r) if r.ty.scope == AUTO_OUTPUT_REGISTER => Ok(Expr::Var(
+            Spanned::internal(CachetPath::from_ident("CacheIR").nest(Ident::from("outputReg"))),
+        )),
         CppExpr::Ref(r) => match r.kind {
             // An instruction's offset parameter, which stands for a field the
             // model already has typed. The model has no notion of an offset, so
@@ -1062,9 +1160,11 @@ fn translate_expr_value(
                     param.name.clone(),
                 ))))
             }
-            // In scope in the translated body, so the name carries over as it is.
+            // In scope in the translated body, so the name carries over -- under
+            // whatever the unit decided to call it, which differs only for a Cachet
+            // keyword.
             RefKind::Param | RefKind::Local => Ok(Expr::Var(Spanned::internal(
-                CachetPath::from_ident(Ident::from(r.name.clone())),
+                CachetPath::from_ident(ctx.names.ident(&r.name)),
             ))),
             // Declared elsewhere, so the name alone doesn't say what it refers
             // to. Emitting it unqualified would either dangle or -- if a local
@@ -1089,7 +1189,7 @@ fn translate_expr_value(
                     .parent()
                     .ok_or_else(|| Unhandled::new(format!("field `{}` outside an ir", r.name)))?;
                 Ok(Expr::Var(Spanned::internal(
-                    parent.nest(Ident::from(r.name.clone())),
+                    parent.nest(ctx.names.ident(&r.name)),
                 )))
             }
         },
@@ -1271,6 +1371,10 @@ fn translate_stmt_values(
     state: &mut State,
     stmt: &CppSpanned<CppStmt>,
 ) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
+    // An idiom first: the plain forms below would translate its pieces literally.
+    if let Some(known) = translate_known_stmt(ctx, state, stmt)? {
+        return Ok(known);
+    }
     match &stmt.value {
         CppStmt::Return(ret) => {
             // A stub generator returns an `AttachDecision`, which is protocol
@@ -1293,25 +1397,110 @@ fn translate_stmt_values(
             })));
             Ok(stmts)
         }
-        CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(CachetIfStmt {
-            cond: Spanned::internal(translate_expr(ctx, state, &s.cond)?),
-            then: translate_block(ctx, state, &s.then)?,
-            // Our `els` is a block, never another `if`, so an `else if` chain
-            // comes out as nested `else { if .. }`.
-            else_: s
-                .els
+        CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(translate_if(ctx, state, s)?))]),
+        // Cachet has no switch, so each case becomes a rung of an `else if` chain
+        // testing the scrutinee against every value sharing that case's body, and
+        // `default:` becomes the final `else`.
+        //
+        // A chain rather than a run of separate `if`s, so the lowering does not
+        // depend on case bodies ending in a `return`. That leaves
+        // `extract_switch`'s termination check doing only its real job: refusing
+        // fall-through, the one thing a chain cannot express.
+        CppStmt::Switch(s) => {
+            // Forward, so gaps are recorded in source order; the chain itself has
+            // to be assembled from the inside out.
+            let mut arms = Vec::new();
+            for case in &s.cases {
+                arms.push((
+                    switch_case_cond(ctx, state, &s.scrutinee, &case.values)?,
+                    translate_block(ctx, state, &case.body)?,
+                ));
+            }
+            let default = s
+                .default
                 .as_ref()
-                .map(|els| translate_block(ctx, state, els).map(ElseClause::Else))
-                .transpose()?,
-        }))]),
+                .map(|default| translate_block(ctx, state, default))
+                .transpose()?;
+
+            let mut else_ = default.map(ElseClause::Else);
+            for (cond, then) in arms.into_iter().rev() {
+                else_ = Some(ElseClause::ElseIf(Box::new(CachetIfStmt {
+                    cond: Spanned::internal(cond),
+                    then,
+                    else_,
+                })));
+            }
+            // The outermost rung is nobody's else clause, so it comes back out.
+            Ok(match else_ {
+                Some(ElseClause::ElseIf(if_stmt)) => vec![Spanned::internal(Stmt::If(*if_stmt))],
+                // A `default:` and no cases at all.
+                Some(ElseClause::Else(block)) => block.stmts,
+                None => Vec::new(),
+            })
+        }
+        // `MOZ_CRASH("..")` says control never reaches here. The model states that
+        // as a proof obligation rather than a runtime abort, so the verifier has to
+        // show the point really is unreachable.
+        CppStmt::Crash(c) => {
+            let mut stmts = Vec::new();
+            if let Some(reason) = &c.reason {
+                stmts.push(Spanned::internal(Stmt::Comment(Comment {
+                    text: format!("MOZ_CRASH({reason:?})"),
+                })));
+            }
+            stmts.push(Spanned::internal(Stmt::Check(CheckStmt {
+                kind: CheckKind::Assert,
+                cond: Spanned::internal(Expr::Var(Spanned::internal(CachetPath::from_ident(
+                    "false",
+                )))),
+            })));
+            Ok(stmts)
+        }
         // Cachet's `let` always binds a value, so a C++ declaration without an
         // initializer -- `Label done;` -- has no counterpart.
+        CppStmt::Let(l) => {
+            let init = l.init.as_ref().ok_or_else(|| {
+                Unhandled::new(format!("declaration of `{}` without an initializer", l.name))
+            })?;
+            Ok(vec![Spanned::internal(Stmt::Let(LetStmt {
+                lhs: LocalVar {
+                    ident: Spanned::internal(ctx.names.ident(&l.name)),
+                    is_mut: false,
+                    // Inferred, as the hand-written models leave it.
+                    type_: None,
+                },
+                rhs: Spanned::internal(translate_expr(ctx, state, init)?),
+            }))])
+        }
+        // An assertion states what the code believes about itself. Dropping one
+        // gives up a proof obligation, so the model is weaker than the C++ but
+        // never disagrees with it.
+        CppStmt::Assert(_) => Err(Unhandled::elided(String::from("assertion"))),
+        CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
+    }
+}
+
+/// A C++ statement whose Cachet counterpart is not the same shape.
+///
+/// The statement counterpart of [`translate_known_expr`] and
+/// [`translate_known_block`], and the boundary the three of them draw: an idiom
+/// lives here, a plain C++ form lives in [`translate_stmt_values`]. Nothing
+/// outside these three is a special case.
+///
+/// `Ok(None)` when the statement is none of these shapes. An `Err` means it *is*
+/// one and could not be translated, which propagates rather than falling through:
+/// the refusal names the idiom instead of whatever the general path would have
+/// made of it.
+fn translate_known_stmt(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    stmt: &CppSpanned<CppStmt>,
+) -> Result<Option<Vec<Spanned<Stmt>>>, Unhandled> {
+    Ok(Some(match &stmt.value {
         // `StubFieldOffset val(valOffset, StubField::Type::RawInt32);` pairs the
         // offset with the kind the C++ lost. The model never lost it -- the op's
         // parameter is already an `Int32Field` -- so the construction says
         // nothing and is dropped, leaving `val` standing for that parameter.
-        //
-        // Ahead of the ordinary declaration arm, which would otherwise claim it.
         CppStmt::Let(l) if stub_field_binding(ctx, l).is_some() => {
             let (local, field) = stub_field_binding(ctx, l).unwrap();
             state.stub_fields.insert(local, field);
@@ -1320,7 +1509,33 @@ fn translate_stmt_values(
                 what: String::from("StubFieldOffset"),
                 span: stmt.span.clone(),
             });
-            Ok(Vec::new())
+            Vec::new()
+        }
+
+        // `Label ifTrue, done;` -- default-constructed, and clang gives one
+        // declaration per declarator, so two statements. The model declares a label
+        // rather than constructing one, and names the `ir` it belongs to: every
+        // label a stub jumps to is a position in the code it emits.
+        CppStmt::Let(l) if is_label_decl(l) => {
+            vec![Spanned::internal(Stmt::Label(LabelStmt {
+                label: CachetLabel {
+                    ident: Spanned::internal(ctx.names.ident(&l.name)),
+                    ir: Spanned::internal(CachetPath::from_ident("MASM")),
+                },
+            }))]
+        }
+
+        // `AutoOutputRegister output(*this);` reserves the result register. The
+        // model has no allocator state to reserve in, so the declaration says
+        // nothing and is dropped; references to `output` become the register
+        // itself.
+        CppStmt::Let(l) if is_output_register_decl(l) => {
+            state.gaps.push(Gap {
+                fidelity: Fidelity::Elided,
+                what: String::from("AutoOutputRegister: the model has no allocator state"),
+                span: stmt.span.clone(),
+            });
+            Vec::new()
         }
 
         // `Register output = allocator.defineRegister(masm, resultId);` binds a
@@ -1335,34 +1550,16 @@ fn translate_stmt_values(
             let init = l.init.as_ref().unwrap();
             let (rhs, id_ty) = translate_allocator_register(ctx, state, init)?;
             state.scopes.insert_register(l.name.clone(), id_ty);
-            Ok(vec![Spanned::internal(Stmt::Let(LetStmt {
+            vec![Spanned::internal(Stmt::Let(LetStmt {
                 lhs: LocalVar {
-                    ident: Spanned::internal(Ident::from(l.name.clone())),
+                    ident: Spanned::internal(ctx.names.ident(&l.name)),
                     is_mut: false,
                     type_: None,
                 },
                 rhs: Spanned::internal(rhs),
-            }))])
+            }))]
         }
 
-        CppStmt::Let(l) => {
-            let init = l.init.as_ref().ok_or_else(|| {
-                Unhandled::new(format!("declaration of `{}` without an initializer", l.name))
-            })?;
-            Ok(vec![Spanned::internal(Stmt::Let(LetStmt {
-                lhs: LocalVar {
-                    ident: Spanned::internal(Ident::from(l.name.clone())),
-                    is_mut: false,
-                    // Inferred, as the hand-written models leave it.
-                    type_: None,
-                },
-                rhs: Spanned::internal(translate_expr(ctx, state, init)?),
-            }))])
-        }
-        // An assertion states what the code believes about itself. Dropping one
-        // gives up a proof obligation, so the model is weaker than the C++ but
-        // never disagrees with it.
-        CppStmt::Assert(_) => Err(Unhandled::elided(String::from("assertion"))),
         // `writer.compareDoubleResult(..)` records a CacheIR op, which Cachet
         // spells `emit CacheIR::CompareDoubleResult(..)`. Arguments carry over
         // unchanged.
@@ -1394,10 +1591,10 @@ fn translate_stmt_values(
                     )?)))
                 })
                 .collect::<Result<Vec<_>, Unhandled>>()?;
-            Ok(vec![Spanned::internal(Stmt::Emit(Call {
+            vec![Spanned::internal(Stmt::Emit(Call {
                 target: Spanned::internal(op_path(op)),
                 args: Spanned::internal(args),
-            }))])
+            }))]
         }
         // `emitLoadStubField(val, reg)` reads the field into a register. The C++
         // is generic and switches on the kind; the model has one function per
@@ -1426,7 +1623,7 @@ fn translate_stmt_values(
             let loader = field_loader(ty)
                 .ok_or_else(|| Unhandled::new(format!("no loader for a `{ty}` in the model")))?;
 
-            Ok(vec![Spanned::internal(Stmt::Expr(Expr::Invoke(Call {
+            vec![Spanned::internal(Stmt::Expr(Expr::Invoke(Call {
                 target: Spanned::internal(
                     CachetPath::from_ident("CacheIR").nest(Ident::from(loader.to_owned())),
                 ),
@@ -1436,7 +1633,7 @@ fn translate_stmt_values(
                     )))),
                     Spanned::internal(Arg::Expr(translate_expr(ctx, state, dst)?)),
                 ]),
-            })))])
+            })))]
         }
 
         CppStmt::Expr(CppExpr::Call(call)) if dropped_call(ctx, call).is_some() => {
@@ -1447,7 +1644,7 @@ fn translate_stmt_values(
                 what: String::from(dropped_call(ctx, call).unwrap()),
                 span: stmt.span.clone(),
             });
-            Ok(Vec::new())
+            Vec::new()
         }
         // `masm.branchTestNull(..)` emits machine code, which Cachet spells
         // `emit MASM::BranchTestNull(..)`. The receiver is ambient, so only the
@@ -1473,10 +1670,10 @@ fn translate_stmt_values(
                     args: Spanned::internal(args),
                 })));
             }
-            Ok(stmts)
+            stmts
         }
-        CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
-    }
+        _ => return Ok(None),
+    }))
 }
 
 /// The C++ lines a span covers.
@@ -1519,6 +1716,62 @@ fn unhandled_comment(e: &Unhandled, stmt: &CppSpan) -> Comment {
         None => format!("unhandled {}", e.what),
     };
     Comment { text }
+}
+
+/// An `if`, keeping an `else if` chain as a chain.
+///
+/// C++ spells `else if` as an else branch holding a single `if`, which
+/// [`extract_branch`](crate::cpp_subset) wraps into a one-statement block. Cachet
+/// has the same form, so recognizing that shape keeps the output a chain instead of
+/// nesting a block per rung -- and skips a scope the C++ never opened.
+fn translate_if(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    s: &CppIfStmt,
+) -> Result<CachetIfStmt, Unhandled> {
+    let cond = Spanned::internal(translate_expr(ctx, state, &s.cond)?);
+    let then = translate_block(ctx, state, &s.then)?;
+    let else_ = match &s.els {
+        None => None,
+        Some(els) => match els.stmts.as_slice() {
+            [only] => match &only.value {
+                CppStmt::If(inner) => {
+                    Some(ElseClause::ElseIf(Box::new(translate_if(ctx, state, inner)?)))
+                }
+                _ => Some(ElseClause::Else(translate_block(ctx, state, els)?)),
+            },
+            _ => Some(ElseClause::Else(translate_block(ctx, state, els)?)),
+        },
+    };
+    Ok(CachetIfStmt { cond, then, else_ })
+}
+
+/// `scrutinee == v1 || scrutinee == v2 || ..`: one switch case's test, over every
+/// label sharing its body.
+fn switch_case_cond(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    scrutinee: &CppSpanned<CppExpr>,
+    values: &[CppSpanned<CppExpr>],
+) -> Result<Expr, Unhandled> {
+    let mut cond: Option<Expr> = None;
+    for value in values {
+        let matches = Expr::BinOper(Box::new(BinOperExpr {
+            oper: Spanned::internal(BinOper::Compare(CompareBinOper::Eq)),
+            lhs: Spanned::internal(translate_expr(ctx, state, scrutinee)?),
+            rhs: Spanned::internal(translate_expr(ctx, state, value)?),
+        }));
+        cond = Some(match cond {
+            None => matches,
+            Some(prev) => Expr::BinOper(Box::new(BinOperExpr {
+                oper: Spanned::internal(BinOper::Logical(LogicalBinOper::Or)),
+                lhs: Spanned::internal(prev),
+                rhs: Spanned::internal(matches),
+            })),
+        });
+    }
+    // `case:` with no value is not a thing clang produces, but the type allows it.
+    cond.ok_or_else(|| Unhandled::new(String::from("switch case with no value to match")))
 }
 
 /// A block of statements. Cachet blocks can also end in a bare tail expression;
@@ -1750,16 +2003,25 @@ pub fn translate_fn_def(
     class: Option<ClassRef>,
     fn_def: &FnDef,
 ) -> Result<(CallableItem, State), Unhandled> {
-    // The writer is ambient, so it is dropped rather than translated; the rest
-    // keep their C++ names, a helper having no second source of names to
-    // reconcile against.
-    let sig = fn_def
+    // The writer is ambient, so it is dropped rather than translated. The rest keep
+    // their C++ names, a helper having no second source of names to reconcile
+    // against -- except where the name is a Cachet keyword, since `JSOpToCondition`
+    // takes a parameter called `op`, which does not parse.
+    let params: Vec<&Param> = fn_def
         .params
         .iter()
         .filter(|param| !is_writer(&param.ty))
+        .collect();
+    let names = NameMap::build(
+        declared_names(&fn_def.params, &fn_def.body)
+            .iter()
+            .map(String::as_str),
+    );
+    let sig = params
+        .iter()
         .map(|param| {
             Ok(SigParam {
-                name: Ident::from(param.name.clone()),
+                name: names.ident(&param.name),
                 ty: translate_type(&param.ty).map_err(|e| {
                     Unhandled::new(format!("parameter `{}`: {}", param.name, e.what))
                 })?,
@@ -1772,8 +2034,11 @@ pub fn translate_fn_def(
     let ctx = Ctx {
         class,
         ops,
-        cpp_sig: Some(fn_def.params.clone()),
+        // The parameters that survive, so the two lists correspond position by
+        // position and a keyword-mangled name can be found from the C++ one.
+        cpp_sig: Some(params.iter().map(|param| (*param).clone()).collect()),
         cachet_sig: Some(sig.clone()),
+        names,
         instruction: None,
     };
 
@@ -1861,6 +2126,11 @@ pub fn translate_gen_def(
     let ctx = Ctx {
         class: Some(gen_def.class.clone()),
         ops,
+        names: NameMap::build(
+            declared_names(&gen_def.def.params, &gen_def.def.body)
+                .iter()
+                .map(String::as_str),
+        ),
         cpp_sig: Some(gen_def.def.params.clone()),
         // The generator's op takes nothing: its `ValOperandId` parameters become
         // `defineInputValueId()` bindings in the body, under the very names the
@@ -2008,6 +2278,17 @@ impl fmt::Display for Error {
             Error::Extract(e) => write!(f, "{e}"),
             Error::Unhandled(e) => write!(f, "{e}"),
             Error::Ops(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl Error {
+    /// The message for a failure the caller asked about by name, deferring to the
+    /// extraction error so the unit it failed in is not named twice.
+    pub fn report(&self, requested: &str) -> String {
+        match self {
+            Error::Extract(e) => e.report(requested),
+            _ => format!("cannot translate {requested}: {self}"),
         }
     }
 }
@@ -2288,13 +2569,26 @@ pub fn translate_cacheir_op(
     // already does and cannot come to shadow them -- except a field's, the one
     // operand whose meaning changes, and which it would be a lie to call
     // `valOffset`.
+    let mut names = NameMap::build(
+        declared_names(&method.def.params, &method.def.body)
+            .iter()
+            .map(String::as_str),
+    );
     let sig = op
         .args
         .iter()
         .zip(&method.def.params)
         .map(|((arg, ty), param)| {
             Ok(SigParam {
-                name: param_ident(if is_stub_field(ty) { arg } else { &param.name }),
+                // A field's name comes from the yaml, not from the C++, so it is the
+                // one name phoenix invents -- and the one that has to be claimed
+                // against the unit, or a local of the same name would shadow it. The
+                // rest are the C++'s own.
+                name: if is_stub_field(ty) {
+                    names.claim(arg)
+                } else {
+                    names.ident(&param.name)
+                },
                 ty: translate_arg_type(ty)?,
             })
         })
@@ -2312,6 +2606,7 @@ pub fn translate_cacheir_op(
     let ctx = Ctx {
         class: Some(method.class.clone()),
         ops: &ops,
+        names,
         cpp_sig: Some(method.def.params.clone()),
         cachet_sig: Some(sig.clone()),
         instruction: Some(Instruction { offsets }),

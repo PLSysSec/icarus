@@ -27,6 +27,11 @@ pub fn is_masm(ty: &CppType) -> bool {
     ty.scope == MASM
 }
 
+/// `js::jit::Label`, a position in the code being emitted. Masm's own type, and
+/// the one thing a stub declares that Cachet has a statement form for rather than
+/// a value.
+pub const LABEL: [&str; 3] = ["js", "jit", "Label"];
+
 /// One op to emit, with the C++ arguments to pass it.
 ///
 /// The arguments stay C++ here: which op to emit is this module's business, while
@@ -156,6 +161,9 @@ fn translate_op(method: &str) -> Option<&'static str> {
     Some(match method {
         "branchTestNull" => "BranchTestNull",
         "branchTestInt32" => "BranchTestInt32",
+        // `Branch32Tag`, `Branch32Imm` and `Branch32AddressImm32` are the model's
+        // other three, all reached by a C++ overload this key cannot tell apart.
+        "branch32" => "Branch32",
         // Templated on the source, `fallibleUnboxBoolean(const T&, Register,
         // Label*)`. The model has the `ValueOperand` instantiation only, which is
         // the one the emitters reach.

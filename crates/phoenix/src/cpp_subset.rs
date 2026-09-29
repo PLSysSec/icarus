@@ -65,9 +65,42 @@ pub enum Stmt {
     /// `MOZ_ASSERT(cond)`, recovered from its `do { ... } while (0)` expansion.
     /// Kept rather than dropped as macro noise: this is what becomes `assume`.
     Assert(AssertStmt),
+    Switch(SwitchStmt),
+    /// `MOZ_CRASH("reason")`: this point is not reached.
+    Crash(CrashStmt),
     /// An expression in statement position. libclang emits no wrapper node for
     /// these; the `CallExpr` hangs directly off the enclosing `CompoundStmt`.
     Expr(Expr),
+}
+
+/// `switch (op) { case Eq: case StrictEq: return Equal; .. default: .. }`.
+///
+/// Cachet has no switch, so this becomes an if-chain -- faithful only because
+/// [`extract_switch`] refuses a case body that would fall through to the next.
+#[derive(Clone, Debug)]
+pub struct SwitchStmt {
+    pub scrutinee: Spanned<Expr>,
+    pub cases: Vec<Case>,
+    /// `None` when the switch has no `default:`.
+    pub default: Option<CompoundStmt>,
+}
+
+/// One case body, with every label that shares it.
+#[derive(Clone, Debug)]
+pub struct Case {
+    /// `case Eq: case StrictEq:` is two values against one body.
+    pub values: Vec<Spanned<Expr>>,
+    /// Not a C++ block -- a case body without braces shares the switch's scope --
+    /// but the same list of statements, and what the translator already consumes.
+    pub body: CompoundStmt,
+}
+
+/// `MOZ_CRASH("Unrecognized comparison operation")`.
+#[derive(Clone, Debug)]
+pub struct CrashStmt {
+    /// The message, kept for the comment it becomes. `None` if the expansion held
+    /// no string literal.
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +344,20 @@ pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
             }
             v.visit_expr(&s.cond.value);
         }
+        Stmt::Switch(s) => {
+            v.visit_expr(&s.scrutinee.value);
+            for case in &s.cases {
+                for value in &case.values {
+                    v.visit_expr(&value.value);
+                }
+                v.visit_block(&case.body);
+            }
+            if let Some(default) = &s.default {
+                v.visit_block(default);
+            }
+        }
+        // No subexpressions: the message is a string literal, not modeled.
+        Stmt::Crash(_) => {}
         Stmt::Expr(e) => v.visit_expr(e),
     }
 }
@@ -357,9 +404,13 @@ impl fmt::Display for Loc {
     }
 }
 
-/// A C++ construct outside the subset we model. Every variant names both what
-/// was found and where, so an unsupported generator reports the line that
-/// defeated it rather than failing anonymously.
+/// A C++ construct outside the subset we model, found while extracting it.
+///
+/// The first of the two ways translation can stop, and the messages say which:
+/// this one means the C++ never made it into [`Stmt`]/[`Expr`] at all, where an
+/// "unhandled" [`Unhandled`](crate::cpp_to_cachet::Unhandled) means it did and has
+/// no Cachet counterpart. Every variant names what was found and where, so a
+/// failure reports the line that defeated it rather than failing anonymously.
 #[derive(Clone, Debug)]
 pub enum Unsupported {
     Stmt {
@@ -396,12 +447,20 @@ pub enum Unsupported {
 impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Unsupported::Stmt { kind, loc } => write!(f, "{loc}: unsupported statement {kind:?}"),
-            Unsupported::Expr { kind, loc } => write!(f, "{loc}: unsupported expression {kind:?}"),
-            Unsupported::Macro { name, loc } => write!(f, "{loc}: unsupported macro `{name}`"),
-            Unsupported::Callee { name, loc } => write!(f, "{loc}: unsupported callee `{name}`"),
+            Unsupported::Stmt { kind, loc } => {
+                write!(f, "{loc}: statement {kind:?} is outside the C++ subset")
+            }
+            Unsupported::Expr { kind, loc } => {
+                write!(f, "{loc}: expression {kind:?} is outside the C++ subset")
+            }
+            Unsupported::Macro { name, loc } => {
+                write!(f, "{loc}: macro `{name}` is outside the C++ subset")
+            }
+            Unsupported::Callee { name, loc } => {
+                write!(f, "{loc}: callee `{name}` is outside the C++ subset")
+            }
             Unsupported::Type { spelled, loc } => {
-                write!(f, "{loc}: unsupported type `{spelled}`")
+                write!(f, "{loc}: type `{spelled}` is outside the C++ subset")
             }
             Unsupported::Malformed { what, loc } => write!(f, "{loc}: {what}"),
         }
@@ -434,6 +493,22 @@ impl fmt::Display for Error {
         match self {
             Error::Signature { what, loc } => write!(f, "{loc}: {what}"),
             Error::Body { unit, cause } => write!(f, "{unit}: {cause}"),
+        }
+    }
+}
+
+impl Error {
+    /// The message for a failure the caller asked about by name.
+    ///
+    /// The unit that failed is not always the one requested -- a generator's
+    /// translation descends into its callees -- so it is worth naming, except when
+    /// it *is* the one requested and naming it twice says nothing.
+    pub fn report(&self, requested: &str) -> String {
+        match self {
+            Error::Body { unit, cause } if unit == requested => {
+                format!("cannot translate {unit}: {cause}")
+            }
+            _ => format!("cannot translate {requested}: {self}"),
         }
     }
 }
@@ -733,13 +808,13 @@ fn extract_stmt_values(e: Entity) -> Result<Vec<Stmt>> {
             };
             Ok(vec![Stmt::Return(ReturnStmt { value })])
         }
-        // Loops, switches and jumps are outside the subset. Naming them as
-        // statements is clearer than letting them fall to the expression path.
+        EntityKind::SwitchStmt => Ok(vec![Stmt::Switch(extract_switch(e)?)]),
+        // Loops and jumps are outside the subset. Naming them as statements is
+        // clearer than letting them fall to the expression path.
         EntityKind::CompoundStmt
         | EntityKind::ForStmt
         | EntityKind::WhileStmt
         | EntityKind::DoStmt
-        | EntityKind::SwitchStmt
         | EntityKind::BreakStmt
         | EntityKind::ContinueStmt
         | EntityKind::GotoStmt => Err(Unsupported::Stmt {
@@ -749,6 +824,135 @@ fn extract_stmt_values(e: Entity) -> Result<Vec<Stmt>> {
         // Anything else in statement position is an expression statement.
         _ => Ok(vec![Stmt::Expr(extract_expr(e)?.value)]),
     }
+}
+
+/// `switch (op) { .. }` into the subset.
+///
+/// Two things about clang's shape drive this. Labels sharing a body nest --
+/// `case Eq: case StrictEq: return x;` is `CaseStmt(Eq, CaseStmt(StrictEq, Ret))`
+/// -- so grouping is a matter of peeling, and no notion of fall-through is needed
+/// for it. And only a body's *first* statement hangs under its label; the rest are
+/// siblings in the switch's block, so a body runs until the next label.
+///
+/// Fall-through proper is refused: every case body must end in a `return` or a
+/// crash, since an if-chain would not fall into the next case. That is stricter
+/// than C++ requires -- the last case may fall out of the switch harmlessly -- but
+/// being wrong here would change what the code does silently.
+fn extract_switch(e: Entity) -> Result<SwitchStmt> {
+    let kids = e.get_children();
+    let [scrutinee, block] = kids.as_slice() else {
+        return Err(Unsupported::Malformed {
+            what: format!("switch with {} children", kids.len()),
+            loc: loc(e),
+        });
+    };
+    if block.get_kind() != EntityKind::CompoundStmt {
+        return Err(Unsupported::Malformed {
+            what: format!("switch body is a {:?}", block.get_kind()),
+            loc: loc(*block),
+        });
+    }
+    let scrutinee = extract_expr(*scrutinee)?;
+
+    let mut cases: Vec<Case> = Vec::new();
+    let mut default: Option<CompoundStmt> = None;
+    // Which body the statements being read belong to: the label most recently
+    // opened.
+    let mut in_default = false;
+
+    for child in block.get_children() {
+        match child.get_kind() {
+            EntityKind::CaseStmt => {
+                in_default = false;
+                let (values, first) = peel_case(child)?;
+                let mut body = CompoundStmt { stmts: Vec::new() };
+                if let Some(first) = first {
+                    body.stmts.extend(extract_stmt(first)?);
+                }
+                cases.push(Case { values, body });
+            }
+            EntityKind::DefaultStmt => {
+                in_default = true;
+                if default.is_some() {
+                    return Err(Unsupported::Malformed {
+                        what: String::from("switch with two defaults"),
+                        loc: loc(child),
+                    });
+                }
+                let mut body = CompoundStmt { stmts: Vec::new() };
+                for inner in child.get_children() {
+                    body.stmts.extend(extract_stmt(inner)?);
+                }
+                default = Some(body);
+            }
+            // Not a label, so it continues the body of the last one opened.
+            _ => {
+                let stmts = extract_stmt(child)?;
+                let body = if in_default {
+                    default.as_mut().map(|body| &mut body.stmts)
+                } else {
+                    cases.last_mut().map(|case| &mut case.body.stmts)
+                };
+                match body {
+                    Some(body) => body.extend(stmts),
+                    None => {
+                        return Err(Unsupported::Malformed {
+                            what: String::from("statement before the switch's first label"),
+                            loc: loc(child),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    for case in &cases {
+        if !ends_execution(&case.body.stmts) {
+            return Err(Unsupported::Malformed {
+                what: String::from("case body falls through, which an if-chain would not"),
+                loc: loc(e),
+            });
+        }
+    }
+
+    Ok(SwitchStmt {
+        scrutinee,
+        cases,
+        default,
+    })
+}
+
+/// The labels sharing one body, and the first statement of that body.
+fn peel_case(case: Entity) -> Result<(Vec<Spanned<Expr>>, Option<Entity>)> {
+    let mut case = case;
+    let mut values = Vec::new();
+    loop {
+        let kids = case.get_children();
+        let (value, rest) = match kids.as_slice() {
+            [value] => (*value, None),
+            [value, inner] => (*value, Some(*inner)),
+            _ => {
+                return Err(Unsupported::Malformed {
+                    what: format!("case with {} children", kids.len()),
+                    loc: loc(case),
+                });
+            }
+        };
+        values.push(extract_expr(value)?);
+        match rest {
+            // The next label of a shared body.
+            Some(inner) if inner.get_kind() == EntityKind::CaseStmt => case = inner,
+            other => return Ok((values, other)),
+        }
+    }
+}
+
+/// Whether a body cannot run off its end, so nothing follows it.
+fn ends_execution(body: &[Spanned<Stmt>]) -> bool {
+    matches!(
+        body.last().map(|stmt| &stmt.value),
+        Some(Stmt::Return(_) | Stmt::Crash(_))
+    )
 }
 
 /// Macro expansions are recognized by name and translated per policy. Anything
@@ -793,8 +997,27 @@ fn extract_macro(e: Entity) -> Result<Stmt> {
                 cond: assert_cond(inner)?,
             }))
         }
+        // `MOZ_CRASH("reason")` says control never gets here. Kept rather than
+        // dropped, because "unreachable" is a claim the model can carry and check.
+        "MOZ_CRASH" => Ok(Stmt::Crash(CrashStmt {
+            reason: crash_reason(e),
+        })),
         _ => Err(Unsupported::Macro { name, loc: loc(e) }),
     }
+}
+
+/// The message a `MOZ_CRASH` was given, from the first string literal in its
+/// expansion. Best effort: it is only ever a comment.
+fn crash_reason(e: Entity) -> Option<String> {
+    let mut found = None;
+    e.visit_children(|child, _| {
+        if child.get_kind() == EntityKind::StringLiteral {
+            found = child.get_display_name().map(|s| s.trim_matches('"').to_owned());
+            return clang::EntityVisitResult::Break;
+        }
+        clang::EntityVisitResult::Recurse
+    });
+    found
 }
 
 /// The statements inside a macro's `do { ... } while (false)`.
@@ -1518,6 +1741,32 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
                 fmt_labelled(f, "Guard", &guard.value, depth + 1)?;
             }
             fmt_labelled(f, "Cond", &s.cond.value, depth + 1)
+        }
+        Stmt::Switch(s) => {
+            indent(f, depth)?;
+            writeln!(f, "SwitchStmt")?;
+            fmt_labelled(f, "Scrutinee", &s.scrutinee.value, depth + 1)?;
+            for case in &s.cases {
+                indent(f, depth + 1)?;
+                writeln!(f, "Case")?;
+                for value in &case.values {
+                    fmt_labelled(f, "Value", &value.value, depth + 2)?;
+                }
+                fmt_block(f, &case.body, depth + 2)?;
+            }
+            if let Some(default) = &s.default {
+                indent(f, depth + 1)?;
+                writeln!(f, "Default")?;
+                fmt_block(f, default, depth + 2)?;
+            }
+            Ok(())
+        }
+        Stmt::Crash(s) => {
+            indent(f, depth)?;
+            match &s.reason {
+                Some(reason) => writeln!(f, "Crash `{reason}`"),
+                None => writeln!(f, "Crash"),
+            }
         }
         Stmt::Expr(e) => fmt_expr(f, e, depth),
     }

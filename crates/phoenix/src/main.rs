@@ -343,30 +343,34 @@ fn main() {
                         report_gaps(symbol, &gaps);
                     }
                     Err(e) => {
-                        eprintln!("cannot translate {symbol}: {e}");
+                        eprintln!("{}", e.report(&symbol));
                         std::process::exit(1);
                     }
                 }
             } else if *unit != Unit::Generator {
                 // A free function has no class, so nothing is ambient; a method
                 // carries its class, which decides what is.
+                // Each arm reports for itself, since extraction knows which unit
+                // failed and the translator does not.
                 let translated = phoenix::cpp_to_cachet::load_ops()
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| format!("cannot translate {symbol}: {e}"))
                     .and_then(|ops| {
                         let (class, fn_def) = match unit {
-                            Unit::Function => {
-                                (None, phoenix::cpp_subset::get_fn_def(&def).map_err(|e| e.to_string())?)
-                            }
+                            Unit::Function => (
+                                None,
+                                phoenix::cpp_subset::get_fn_def(&def)
+                                    .map_err(|e| e.report(symbol))?,
+                            ),
                             _ => {
                                 let m = phoenix::cpp_subset::get_method_def(&def)
-                                    .map_err(|e| e.to_string())?;
+                                    .map_err(|e| e.report(symbol))?;
                                 (Some(m.class), m.def)
                             }
                         };
                         phoenix::cpp_to_cachet::translate_fn_and_transitive_callees(
                             &ops, class, fn_def,
                         )
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| format!("cannot translate {symbol}: {e}"))
                     });
                 match translated {
                     Ok((items, gaps)) => {
@@ -378,7 +382,7 @@ fn main() {
                         report_gaps(symbol, &gaps);
                     }
                     Err(e) => {
-                        eprintln!("cannot translate {symbol}: {e}");
+                        eprintln!("{e}");
                         std::process::exit(1);
                     }
                 }
@@ -398,7 +402,7 @@ fn main() {
                         }
                     }
                     Err(e) => {
-                        eprintln!("cannot translate {symbol}: {e}");
+                        eprintln!("{}", e.report(&symbol));
                         std::process::exit(1);
                     }
                 }
