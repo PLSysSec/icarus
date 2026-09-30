@@ -409,9 +409,39 @@ pub fn writer_method(op: &Op) -> String {
     name
 }
 
-/// `CacheIR::BooleanToNumber`, the target of an `emit`.
-pub fn op_path(op: &Op) -> CachetPath {
-    CachetPath::from_ident("CacheIR").nest(Ident::from(op.name.clone()))
+/// Which `ir` a translated generator emits its CacheIR ops into.
+///
+/// The two cannot be one `ir`: it cannot be declared twice (`duplicate definition of
+/// CacheIR`) and cannot be extended by an `impl` (`expected type, found IR`). So the
+/// translated ops need an `ir` of their own, and this is the single point that decides
+/// which of the two a generator is built against. Either way the ops reach the modeled
+/// functions -- `CacheIR::useInt32Id` and the rest -- across `ir` boundaries, which
+/// Cachet allows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpIr {
+    /// The hand-written `ir CacheIR`, for running a translated generator against the
+    /// existing model.
+    Model,
+    /// The ops phoenix translated, in an `ir` beside the model's.
+    Generated,
+}
+
+impl OpIr {
+    pub fn name(self) -> &'static str {
+        match self {
+            OpIr::Model => "CacheIR",
+            OpIr::Generated => "CacheIROps",
+        }
+    }
+
+    pub fn path(self) -> CachetPath {
+        CachetPath::from_ident(self.name())
+    }
+}
+
+/// `CacheIROps::BooleanToNumber`, the target of an `emit`.
+pub fn op_path(op: &Op, ir: OpIr) -> CachetPath {
+    ir.path().nest(Ident::from(op.name.clone()))
 }
 
 /// How many operands the writer method takes, which is every operand the caller
@@ -428,7 +458,6 @@ pub fn writer_arity(op: &Op) -> usize {
 /// as it is a parameter of `CacheIRCompiler::emit<Op>`.
 #[derive(Debug)]
 pub struct OpSig {
-    pub path: CachetPath,
     pub params: Vec<CachetParam>,
 }
 
@@ -484,10 +513,7 @@ pub struct HelperSig {
 
 pub fn op_sig(op: &Op) -> Result<OpSig, Unhandled> {
     let params = op_params(op)?.iter().map(SigParam::to_param).collect();
-    Ok(OpSig {
-        path: op_path(op),
-        params,
-    })
+    Ok(OpSig { params })
 }
 
 /// `None` for an op that needs no wrapper, which is every op without a `result`
@@ -550,7 +576,7 @@ fn let_stmt(ident: Ident, rhs: Expr) -> Spanned<Stmt> {
 /// The Cachet counterpart of the generated `CacheIRWriter` method, doing what
 /// `gen_writer_method` does in `GenerateCacheIRFiles.py`: write each field into
 /// the stub data, allocate the result slot, emit the op, hand the slot back.
-pub fn create_op_wrapper(op: &Op) -> Result<CallableItem, Unhandled> {
+pub fn create_op_wrapper(op: &Op, ir: OpIr) -> Result<CallableItem, Unhandled> {
     let Some(helper) = helper_sig(op)? else {
         return Err(Unhandled::new(format!(
             "op `{}` allocates nothing, so it needs no wrapper",
@@ -595,7 +621,7 @@ pub fn create_op_wrapper(op: &Op) -> Result<CallableItem, Unhandled> {
     }
 
     stmts.push(Spanned::internal(Stmt::Emit(Call {
-        target: Spanned::internal(op_path(op)),
+        target: Spanned::internal(op_path(op, ir)),
         args: Spanned::internal(args),
     })));
     stmts.push(Spanned::internal(Stmt::Ret(RetStmt {
@@ -607,7 +633,8 @@ pub fn create_op_wrapper(op: &Op) -> Result<CallableItem, Unhandled> {
         attrs: Vec::new(),
         is_unsafe: false,
         params: helper.params,
-        emits: Some(Spanned::internal(CachetPath::from_ident("CacheIR"))),
+        // Emitting an op, so it targets whichever `ir` the ops are in.
+        emits: Some(Spanned::internal(ir.path())),
         ret: Some(Spanned::internal(helper.ret)),
         body: Spanned::internal(Some(Block {
             stmts,
@@ -647,9 +674,15 @@ mod tests {
 
         // No result: an `emit` target, no wrapper.
         let guard_is_null = ops.get("GuardIsNull").unwrap();
-        let sig = op_sig(guard_is_null).unwrap();
-        assert_eq!(sig.path.to_string(), "CacheIR::GuardIsNull");
-        assert_eq!(render(&sig.params), "input: ValueId");
+        assert_eq!(
+            op_path(guard_is_null, OpIr::Generated).to_string(),
+            "CacheIROps::GuardIsNull"
+        );
+        assert_eq!(
+            op_path(guard_is_null, OpIr::Model).to_string(),
+            "CacheIR::GuardIsNull"
+        );
+        assert_eq!(render(&op_sig(guard_is_null).unwrap().params), "input: ValueId");
         assert_eq!(writer_method(guard_is_null), "guardIsNull");
         assert!(helper_sig(guard_is_null).unwrap().is_none());
 
@@ -730,21 +763,36 @@ mod tests {
 
         // `CallableItem` prints only through `Item`, which supplies the keyword.
         let wrapper = cachet_lang::parser::Item::Fn(
-            create_op_wrapper(ops.get("LoadInt32Constant").unwrap()).unwrap(),
+            create_op_wrapper(ops.get("LoadInt32Constant").unwrap(), OpIr::Generated).unwrap(),
         );
+        // `OpIr` moves the `emits` clause and the emit target, and nothing else:
+        // `writeInt32Field` and `newInt32Id` are modeled functions and stay in
+        // `CacheIR` either way.
         assert_eq!(
             wrapper.to_string().split_whitespace().collect::<Vec<_>>(),
-            "fn loadInt32Constant(val: Int32) emits CacheIR -> Int32Id { \
+            "fn loadInt32Constant(val: Int32) emits CacheIROps -> Int32Id { \
              let valField = CacheIR::writeInt32Field(val); \
              let result = CacheIR::newInt32Id(); \
-             emit CacheIR::LoadInt32Constant(valField, result); \
+             emit CacheIROps::LoadInt32Constant(valField, result); \
              return result; }"
                 .split_whitespace()
                 .collect::<Vec<_>>()
         );
 
+        // Against the hand-written model, the same wrapper targets `ir CacheIR`.
+        let against_model = cachet_lang::parser::Item::Fn(
+            create_op_wrapper(ops.get("LoadInt32Constant").unwrap(), OpIr::Model).unwrap(),
+        )
+        .to_string();
+        assert!(
+            against_model.contains("emits CacheIR ")
+                && against_model.contains("emit CacheIR::LoadInt32Constant"),
+            "{against_model}"
+        );
+
         // `newNumberId` doesn't exist in the model, so this one can't be built.
-        let e = create_op_wrapper(ops.get("BooleanToNumber").unwrap()).unwrap_err();
+        let e =
+            create_op_wrapper(ops.get("BooleanToNumber").unwrap(), OpIr::Generated).unwrap_err();
         assert!(e.what.contains("no allocator for `NumberId`"), "{}", e.what);
     }
 

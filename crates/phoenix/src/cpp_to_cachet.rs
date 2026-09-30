@@ -17,7 +17,7 @@ use cachet_lang::parser::{
 use clang::{Entity, EntityKind};
 
 use crate::cacheir_ops::{
-    Op as CacheIrOp, Ops, SigParam, create_op_wrapper, field_loader, helper_sig, id_definer,
+    Op as CacheIrOp, OpIr, Ops, SigParam, create_op_wrapper, field_loader, helper_sig, id_definer,
     id_user, is_operand_id, is_stub_field, op_path, translate_arg_type, writer_arity,
     writer_method,
 };
@@ -581,6 +581,10 @@ struct Ctx<'a> {
     class: Option<ClassRef>,
     /// `CacheIROps.yaml`, which decides what a `writer` call becomes.
     ops: &'a Ops,
+    /// Which `ir` an emitted op belongs to. Only op paths and the `emits` clauses
+    /// aimed at them depend on this; every modeled function stays in `CacheIR`
+    /// whichever way it is set.
+    op_ir: OpIr,
     /// The parameters of the C++ definition, and of the Cachet item it becomes.
     ///
     /// Both, because they disagree: the body is written against the first, the
@@ -667,8 +671,9 @@ impl Ctx<'_> {
     fn parent(&self) -> Option<CachetPath> {
         let class = self.class.as_ref()?;
         if class.scope == CACHE_IR_COMPILER {
-            // An instruction is an `op` in `ir CacheIR`, not in its own class.
-            return Some(CachetPath::from_ident("CacheIR"));
+            // An instruction is an `op` in whichever `ir` holds the ops, not in its
+            // own class.
+            return Some(self.op_ir.path());
         }
         self.is_stub_generator()
             .then(|| CachetPath::from_ident(Ident::from(class.name().to_owned())))
@@ -1680,7 +1685,7 @@ fn translate_known_stmt(
                 })
                 .collect::<Result<Vec<_>, Unhandled>>()?;
             vec![Spanned::internal(Stmt::Emit(Call {
-                target: Spanned::internal(op_path(op)),
+                target: Spanned::internal(op_path(op, ctx.op_ir)),
                 args: Spanned::internal(args),
             }))]
         }
@@ -2103,6 +2108,7 @@ fn discharge(obligations: Vec<Obligation>) -> Vec<Spanned<Stmt>> {
 /// entry bottoms out there instead, and never needs translating.
 pub fn translate_fn_def(
     ops: &Ops,
+    op_ir: OpIr,
     class: Option<ClassRef>,
     fn_def: &FnDef,
 ) -> Result<(CallableItem, State), Unhandled> {
@@ -2137,6 +2143,7 @@ pub fn translate_fn_def(
     let ctx = Ctx {
         class,
         ops,
+        op_ir,
         // The parameters that survive, so the two lists correspond position by
         // position and a keyword-mangled name can be found from the C++ one.
         cpp_sig: Some(params.iter().map(|param| (*param).clone()).collect()),
@@ -2154,13 +2161,14 @@ pub fn translate_fn_def(
     // a register, so it emits machine code.
     let takes = |p: fn(&CppType) -> bool| fn_def.params.iter().any(|param| p(&param.ty));
     let emits = if ctx.recv_is_writer() || takes(is_writer) {
-        Some("CacheIR")
+        // Taking the writer means emitting ops, so it follows wherever they are.
+        Some(op_ir.path())
     } else if takes(is_masm) {
-        Some("MASM")
+        Some(CachetPath::from_ident("MASM"))
     } else {
         None
     }
-    .map(|ir| Spanned::internal(CachetPath::from_ident(ir)));
+    .map(Spanned::internal);
 
     let params = sig.iter().map(SigParam::to_param).collect();
 
@@ -2234,6 +2242,7 @@ fn create_generator_op(
 /// `ir`, and every stub generator emits CacheIR.
 pub fn translate_gen_def(
     ops: &Ops,
+    op_ir: OpIr,
     gen_def: &MethodDef,
 ) -> Result<(IrItem, State), Unhandled> {
     // `writer` is how the C++ emits, not state the generator holds: each
@@ -2247,6 +2256,7 @@ pub fn translate_gen_def(
     let ctx = Ctx {
         class: Some(gen_def.class.clone()),
         ops,
+        op_ir,
         names: NameMap::build(
             declared_names(&gen_def.def.params, &gen_def.def.body)
                 .iter()
@@ -2284,7 +2294,8 @@ pub fn translate_gen_def(
             // Spans are `internal` throughout: these nodes are synthesized, so
             // there is no Cachet source location to point at.
             ident: Spanned::internal(Ident::from(gen_def.class.name().to_owned())),
-            emits: Some(Spanned::internal(CachetPath::from_ident("CacheIR"))),
+            // Whichever `ir` the ops it emits are in.
+            emits: Some(Spanned::internal(op_ir.path())),
             items,
         },
         state,
@@ -2522,6 +2533,7 @@ fn extract_helper<'tu>(entity: &Entity<'tu>) -> Result<(Option<ClassRef>, FnDef<
 /// for.
 fn translate_transitive_callees<'tu>(
     ops: &Ops,
+    op_ir: OpIr,
     mut callees: Callees<'tu>,
     seed: State,
     mut seen: HashSet<FnId>,
@@ -2543,7 +2555,7 @@ fn translate_transitive_callees<'tu>(
                 // The op is in the table -- resolving the call is what put this
                 // on the queue -- so only synthesis can fail from here.
                 let op = ops.get(&op_name).expect("op resolved earlier");
-                match create_op_wrapper(op) {
+                match create_op_wrapper(op, op_ir) {
                     Ok(item) => helpers.push(Spanned::internal(Item::Fn(item))),
                     Err(e) => {
                         let what =
@@ -2596,7 +2608,7 @@ fn translate_transitive_callees<'tu>(
                 continue;
             }
         };
-        match translate_fn_def(&ops, class, &fn_def) {
+        match translate_fn_def(ops, op_ir, class, &fn_def) {
             Ok((item, more)) => {
                 helpers.push(Spanned::internal(Item::Fn(item)));
                 callees.extend(fn_def.callees);
@@ -2624,14 +2636,16 @@ fn translate_transitive_callees<'tu>(
 /// helpers it depends on have to be defined before it reads.
 pub fn translate_fn_and_transitive_callees<'tu>(
     ops: &Ops,
+    op_ir: OpIr,
     class: Option<ClassRef>,
     fn_def: FnDef<'tu>,
 ) -> Result<(Vec<Spanned<Item>>, Vec<Gap>), Unhandled> {
     // Seeded with the definition itself, so one that reaches back into itself
     // isn't translated a second time.
     let seen = HashSet::from([fn_def.name.id.clone()]);
-    let (item, state) = translate_fn_def(ops, class, &fn_def)?;
-    let (mut items, gaps) = translate_transitive_callees(ops, fn_def.callees, state, seen);
+    let (item, state) = translate_fn_def(ops, op_ir, class, &fn_def)?;
+    let (mut items, gaps) =
+        translate_transitive_callees(ops, op_ir, fn_def.callees, state, seen);
     items.push(Spanned::internal(Item::Fn(item)));
     Ok((items, gaps))
 }
@@ -2653,6 +2667,7 @@ pub fn translate_fn_and_transitive_callees<'tu>(
 /// `val` -- comes next.
 pub fn translate_cacheir_op(
     ops: &Ops,
+    op_ir: OpIr,
     method: &MethodDef,
 ) -> Result<(CallableItem, State), Unhandled> {
     let name = method
@@ -2724,6 +2739,7 @@ pub fn translate_cacheir_op(
     let ctx = Ctx {
         class: Some(method.class.clone()),
         ops,
+        op_ir,
         names,
         cpp_sig: Some(method.def.params.clone()),
         cachet_sig: Some(sig.clone()),
@@ -2759,31 +2775,35 @@ pub fn translate_cacheir_op(
 /// them for the same reason.
 pub fn translate_cacheir_op_and_helpers(
     instruction: &Entity<'_>,
+    op_ir: OpIr,
 ) -> Result<(CallableItem, Vec<Spanned<Item>>, Vec<Gap>), Error> {
     let ops = load_ops()?;
     let method = get_method_def(instruction)?;
     // Seeded with the instruction itself, so an emitter that reaches back into
     // itself isn't translated a second time.
     let seen = HashSet::from([method.def.name.id.clone()]);
-    let (op, state) = translate_cacheir_op(&ops, &method)?;
-    let (helpers, gaps) = translate_transitive_callees(&ops, method.def.callees, state, seen);
+    let (op, state) = translate_cacheir_op(&ops, op_ir, &method)?;
+    let (helpers, gaps) =
+        translate_transitive_callees(&ops, op_ir, method.def.callees, state, seen);
     Ok((op, helpers, gaps))
 }
 
 pub fn translate_generator(
     generator: &Entity<'_>,
+    op_ir: OpIr,
     imports: &Path,
 ) -> Result<Translation, Error> {
     let ops = load_ops()?;
     let gen_def = get_method_def(generator)?;
     let unit = format!("{}::{}", gen_def.class, gen_def.def.name.name);
-    let (ir, state) = translate_gen_def(&ops, &gen_def)?;
+    let (ir, state) = translate_gen_def(&ops, op_ir, &gen_def)?;
 
     // Each definition brings its own callees, so deeper helpers stay resolvable.
     // Seeded with the generator itself, so a helper that calls back into it is
     // not translated a second time.
     let (helpers, gaps) = translate_transitive_callees(
         &ops,
+        op_ir,
         gen_def.def.callees,
         state,
         HashSet::from([gen_def.def.name.id]),

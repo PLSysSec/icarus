@@ -22,6 +22,7 @@
 
 use clang::{Clang, Entity, EntityKind, Index};
 use clap::{Parser, Subcommand, ValueEnum};
+use phoenix::cacheir_ops::OpIr;
 use phoenix::clang_utils::{find_definition, get_errors, parse_file, qualified_name};
 use std::path::{Path, PathBuf};
 
@@ -265,6 +266,11 @@ enum Cmd {
         /// elsewhere needs its own, e.g. `../../notes`.
         #[arg(long, default_value = "..")]
         imports: PathBuf,
+        /// Emit ops into the hand-written `ir CacheIR` instead of the generated
+        /// `ir CacheIROps`, to run a translated generator against the existing
+        /// model rather than against translated instructions.
+        #[arg(long)]
+        model_ops: bool,
     },
     /// Dump the generator lowered into the modeled C++ subset.
     Subset { symbol: String },
@@ -333,10 +339,16 @@ fn main() {
             out,
             imports,
             unit,
+            model_ops,
             ..
         } => {
+            let op_ir = if *model_ops {
+                OpIr::Model
+            } else {
+                OpIr::Generated
+            };
             if *unit == Unit::Instruction {
-                match phoenix::cpp_to_cachet::translate_cacheir_op_and_helpers(&def) {
+                match phoenix::cpp_to_cachet::translate_cacheir_op_and_helpers(&def, op_ir) {
                     Ok((op, helpers, gaps)) => {
                         // Helpers first, as the generator path orders them: what a
                         // definition needs comes before the definition.
@@ -374,7 +386,7 @@ fn main() {
                             }
                         };
                         phoenix::cpp_to_cachet::translate_fn_and_transitive_callees(
-                            &ops, class, fn_def,
+                            &ops, op_ir, class, fn_def,
                         )
                         .map_err(|e| format!("cannot translate {symbol}: {e}"))
                     });
@@ -394,7 +406,7 @@ fn main() {
                 }
             } else {
                 // The generator plus every helper it calls.
-                match phoenix::cpp_to_cachet::translate_generator(&def, imports) {
+                match phoenix::cpp_to_cachet::translate_generator(&def, op_ir, imports) {
                     Ok(translation) => {
                         write_out(out.as_deref(), &format!("{}\n", translation.module));
                         // Nonzero on a partial translation, so a shell chain
