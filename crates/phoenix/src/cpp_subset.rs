@@ -48,6 +48,23 @@ impl<T> Spanned<T> {
     }
 }
 
+/// An expression, with the span and the type clang gave it.
+///
+/// The type sits on the node rather than on the variants because that is how clang
+/// hands it over -- `clang_getCursorType` answers for any expression cursor, not
+/// just a name. Per-variant fields would make "does this have a type" an accident of
+/// which shapes someone happened to need, which is how a chained receiver like
+/// `output.typedReg().gpr()` came to have no type to look up.
+#[derive(Clone, Debug)]
+pub struct TypedExpr {
+    pub span: Span,
+    pub value: Expr,
+    /// `None` only when the type is outside the subset, never because nothing
+    /// recorded it. `failure->label()` is a `Label*`, which the subset declines to
+    /// model, and translates fine all the same.
+    pub ty: Option<Type>,
+}
+
 /// A "small C++": the subset of the clang AST a CacheIR stub generator body
 /// actually uses, with the implicit-conversion scaffolding already stripped.
 /// Everything here is reachable from inside a body, so there are no
@@ -70,7 +87,10 @@ pub enum Stmt {
     Crash(CrashStmt),
     /// An expression in statement position. libclang emits no wrapper node for
     /// these; the `CallExpr` hangs directly off the enclosing `CompoundStmt`.
-    Expr(Expr),
+    ///
+    /// The whole node, not a bare [`Expr`]: a statement expression has a type like
+    /// any other, and discarding it would mean rebuilding one at the use site.
+    Expr(TypedExpr),
 }
 
 /// `switch (op) { case Eq: case StrictEq: return Equal; .. default: .. }`.
@@ -79,7 +99,7 @@ pub enum Stmt {
 /// [`extract_switch`] refuses a case body that would fall through to the next.
 #[derive(Clone, Debug)]
 pub struct SwitchStmt {
-    pub scrutinee: Spanned<Expr>,
+    pub scrutinee: TypedExpr,
     pub cases: Vec<Case>,
     /// `None` when the switch has no `default:`.
     pub default: Option<CompoundStmt>,
@@ -89,7 +109,7 @@ pub struct SwitchStmt {
 #[derive(Clone, Debug)]
 pub struct Case {
     /// `case Eq: case StrictEq:` is two values against one body.
-    pub values: Vec<Spanned<Expr>>,
+    pub values: Vec<TypedExpr>,
     /// Not a C++ block -- a case body without braces shares the switch's scope --
     /// but the same list of statements, and what the translator already consumes.
     pub body: CompoundStmt,
@@ -105,7 +125,7 @@ pub struct CrashStmt {
 
 #[derive(Clone, Debug)]
 pub struct IfStmt {
-    pub cond: Spanned<Expr>,
+    pub cond: TypedExpr,
     pub then: CompoundStmt,
     pub els: Option<CompoundStmt>,
 }
@@ -115,20 +135,20 @@ pub struct IfStmt {
 pub struct LetStmt {
     pub name: String,
     pub ty: Type,
-    pub init: Option<Spanned<Expr>>,
+    pub init: Option<TypedExpr>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ReturnStmt {
-    pub value: Option<Spanned<Expr>>,
+    pub value: Option<TypedExpr>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AssertStmt {
     /// `MOZ_ASSERT_IF`'s first argument: the assertion holds only where this
     /// does. `None` for a plain `MOZ_ASSERT`.
-    pub guard: Option<Spanned<Expr>>,
-    pub cond: Spanned<Expr>,
+    pub guard: Option<TypedExpr>,
+    pub cond: TypedExpr,
 }
 
 #[derive(Clone, Debug)]
@@ -156,13 +176,13 @@ pub enum Expr {
 #[derive(Clone, Debug)]
 pub struct Construct {
     pub ty: Type,
-    pub args: Vec<Spanned<Expr>>,
+    pub args: Vec<TypedExpr>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Call {
     pub callee: Callee,
-    pub args: Vec<Spanned<Expr>>,
+    pub args: Vec<TypedExpr>,
 }
 
 /// clang's Unified Symbol Resolution. Separates overloads, and encodes the file
@@ -188,7 +208,7 @@ pub enum Callee {
     /// LIBCLANG: an implicit `this` receiver is absent from the tree, hence the
     /// `Option` -- clang's own AST has a `CXXThisExpr` there.
     Method {
-        recv: Option<Box<Spanned<Expr>>>,
+        recv: Option<Box<TypedExpr>>,
         callee: FnRef,
     },
 }
@@ -196,14 +216,14 @@ pub enum Callee {
 #[derive(Clone, Debug)]
 pub struct UnaryOp {
     pub op: String,
-    pub operand: Box<Spanned<Expr>>,
+    pub operand: Box<TypedExpr>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BinaryOp {
     pub op: String,
-    pub lhs: Box<Spanned<Expr>>,
-    pub rhs: Box<Spanned<Expr>>,
+    pub lhs: Box<TypedExpr>,
+    pub rhs: Box<TypedExpr>,
 }
 
 /// A name in expression position, resolved to what it refers to.
@@ -358,7 +378,7 @@ pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
         }
         // No subexpressions: the message is a string literal, not modeled.
         Stmt::Crash(_) => {}
-        Stmt::Expr(e) => v.visit_expr(e),
+        Stmt::Expr(e) => v.visit_expr(&e.value),
     }
 }
 
@@ -822,7 +842,7 @@ fn extract_stmt_values(e: Entity) -> Result<Vec<Stmt>> {
             loc: loc(e),
         }),
         // Anything else in statement position is an expression statement.
-        _ => Ok(vec![Stmt::Expr(extract_expr(e)?.value)]),
+        _ => Ok(vec![Stmt::Expr(extract_expr(e)?)]),
     }
 }
 
@@ -923,7 +943,7 @@ fn extract_switch(e: Entity) -> Result<SwitchStmt> {
 }
 
 /// The labels sharing one body, and the first statement of that body.
-fn peel_case(case: Entity) -> Result<(Vec<Spanned<Expr>>, Option<Entity>)> {
+fn peel_case(case: Entity) -> Result<(Vec<TypedExpr>, Option<Entity>)> {
     let mut case = case;
     let mut values = Vec::new();
     loop {
@@ -1036,7 +1056,7 @@ fn do_body(e: Entity) -> Result<Vec<Entity>> {
 /// condition is `MOZ_UNLIKELY(!MOZ_CHECK_ASSERT_ASSIGNMENT(expr))`
 /// (`Assertions.h:535`), so the asserted expression sits under a chain of
 /// macro-written negations and parens.
-fn assert_cond(do_stmt: Entity) -> Result<Spanned<Expr>> {
+fn assert_cond(do_stmt: Entity) -> Result<TypedExpr> {
     let if_stmt = do_body(do_stmt)?
         .into_iter()
         .find(|c| c.get_kind() == EntityKind::IfStmt)
@@ -1165,11 +1185,16 @@ fn extract_decls(e: Entity) -> Result<Vec<LetStmt>> {
         .collect()
 }
 
-fn extract_expr(e: Entity) -> Result<Spanned<Expr>> {
-    // The span of the stripped node: the implicit wrappers cover the same text
-    // anyway, and this is the node the value describes.
+fn extract_expr(e: Entity) -> Result<TypedExpr> {
+    // The span and type of the stripped node: the implicit wrappers cover the same
+    // text and the same type, and this is the node the value describes.
     let e = strip(e);
-    Ok(Spanned::new(span_of(e), extract_expr_value(e)?))
+    Ok(TypedExpr {
+        span: span_of(e),
+        value: extract_expr_value(e)?,
+        // A type the subset cannot model is not a reason to refuse the expression.
+        ty: extract_type(e).ok(),
+    })
 }
 
 fn extract_expr_value(e: Entity) -> Result<Expr> {
@@ -1768,7 +1793,7 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
                 None => writeln!(f, "Crash"),
             }
         }
-        Stmt::Expr(e) => fmt_expr(f, e, depth),
+        Stmt::Expr(e) => fmt_expr(f, &e.value, depth),
     }
 }
 

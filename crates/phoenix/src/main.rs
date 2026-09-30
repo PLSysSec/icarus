@@ -336,10 +336,16 @@ fn main() {
             ..
         } => {
             if *unit == Unit::Instruction {
-                match phoenix::cpp_to_cachet::translate_cacheir_op(&def) {
-                    Ok((op, gaps)) => {
-                        let item = cachet_lang::parser::Item::Op(op);
-                        write_out(out.as_deref(), &format!("{item}\n"));
+                match phoenix::cpp_to_cachet::translate_cacheir_op_and_helpers(&def) {
+                    Ok((op, helpers, gaps)) => {
+                        // Helpers first, as the generator path orders them: what a
+                        // definition needs comes before the definition.
+                        let mut text: String = helpers
+                            .iter()
+                            .map(|helper| format!("{}\n", helper.value))
+                            .collect();
+                        text.push_str(&format!("{}\n", cachet_lang::parser::Item::Op(op)));
+                        write_out(out.as_deref(), &text);
                         report_gaps(symbol, &gaps);
                     }
                     Err(e) => {

@@ -16,15 +16,22 @@
 use cachet_lang::ast::Path as CachetPath;
 
 use crate::cpp_subset::{
-    Callee as CppCallee, Expr as CppExpr, Spanned as CppSpanned, Stmt as CppStmt, Type as CppType,
+    Callee as CppCallee, Expr as CppExpr, Stmt as CppStmt, Type as CppType,
+    TypedExpr as CppTypedExpr,
 };
+use crate::cpp_to_cachet::translate_type;
 use crate::scopes::Scopes;
 
 /// `js::jit::StackMacroAssembler`, the `masm` field code is emitted through.
 pub const MASM: [&str; 3] = ["js", "jit", "StackMacroAssembler"];
 
+/// `js::jit::MacroAssembler`, the base the `masm` field is a `StackMacroAssembler`
+/// of. A helper takes it in this spelling -- `EmitStoreBoolean(MacroAssembler&, ..)`
+/// -- so both name the same machine.
+pub const MACRO_ASSEMBLER: [&str; 3] = ["js", "jit", "MacroAssembler"];
+
 pub fn is_masm(ty: &CppType) -> bool {
-    ty.scope == MASM
+    ty.scope == MASM || ty.scope == MACRO_ASSEMBLER
 }
 
 /// `js::jit::Label`, a position in the code being emitted. Masm's own type, and
@@ -32,29 +39,42 @@ pub fn is_masm(ty: &CppType) -> bool {
 /// a value.
 pub const LABEL: [&str; 3] = ["js", "jit", "Label"];
 
-/// One op to emit, with the C++ arguments to pass it.
+/// What one `masm.<method>(..)` call becomes in the model.
 ///
-/// The arguments stay C++ here: which op to emit is this module's business, while
+/// Arguments stay C++ here: which statement a call means is this module's business,
 /// turning an expression into Cachet is the translator's.
 #[derive(Debug)]
-pub struct Emit<'e> {
-    pub op: &'static str,
-    pub args: Vec<&'e CppSpanned<CppExpr>>,
+pub enum MasmStmt<'e> {
+    Emit {
+        op: &'static str,
+        args: Vec<&'e CppTypedExpr>,
+    },
+    /// `bind ifTrue;`. A statement of its own rather than a call, so it names its
+    /// label instead of passing one.
+    ///
+    /// A label in *argument* position needs no such treatment: it rides through as an
+    /// expression and the Cachet parser resolves it against the op's signature, which
+    /// phoenix cannot do because it never reads the model. A `bind` has no argument
+    /// position to hide a label in.
+    Bind { label: &'e CppTypedExpr },
 }
 
-/// The ops a `masm.<method>(..)` statement emits.
+/// The statements a `masm.<method>(..)` call becomes.
 ///
-/// Usually one, but not always: a single masm call can mean a sequence in the
-/// model, because the model tracks what kind of value a register holds where the
-/// machine just moves bits. `move32` into a register declared int32 from one
-/// holding a bool is `Move32Bool` followed by `CastBoolToInt32`, the second having
+/// Usually one, but not always: the model tracks what kind of value a register holds
+/// where the machine just moves bits, so a `move32` into a register declared int32
+/// from one holding a bool is `Move32Bool` followed by a `CastBoolToInt32` that has
 /// no counterpart in the C++ at all.
 ///
 /// `None` where the statement isn't a masm call at all, and where it is one the
 /// model has no op for -- the two are told apart by the error the caller reports,
 /// not here.
-pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<Emit<'e>>> {
-    let CppStmt::Expr(CppExpr::Call(call)) = stmt else {
+pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<MasmStmt<'e>>> {
+    let CppStmt::Expr(CppTypedExpr {
+        value: CppExpr::Call(call),
+        ..
+    }) = stmt
+    else {
         return None;
     };
     let CppCallee::Method {
@@ -68,17 +88,29 @@ pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<Emit<'e>>
         return None;
     }
 
-    let op = match callee.name.as_str() {
-        // The one method whose op depends on what a register holds rather than on
-        // the call, both C++ overloads being `(Register, Register)`.
-        "move32" => move32_op(&call.args, scopes)?,
-        method => translate_op(method)?,
-    };
-    let args = call.args.iter().collect();
+    // `bind` is not a call in the model at all, so it leaves before the op
+    // machinery: there is no op to name and no coercion to owe.
+    if callee.name == "bind" {
+        let [label] = call.args.as_slice() else {
+            return None;
+        };
+        return Some(vec![MasmStmt::Bind { label }]);
+    }
 
-    let mut emits = vec![Emit { op, args }];
-    emits.extend(coerce_written(op, &call.args, scopes));
-    Some(emits)
+    // Two methods need more than a name-and-shape lookup, for different reasons, so
+    // they sit here rather than in the table.
+    let (op, args) = match callee.name.as_str() {
+        // Its op depends on what a register *holds*, which is nowhere in the call:
+        // both C++ overloads are `(Register, Register)`.
+        "move32" => (move32_op(&call.args, scopes)?, call.args.iter().collect()),
+        // Its op absorbs the immediate, so choosing it also rewrites an argument.
+        "movePtr" => move_ptr(&call.args)?,
+        method => (translate_op(method, &call.args)?, call.args.iter().collect()),
+    };
+
+    let mut stmts = vec![MasmStmt::Emit { op, args }];
+    stmts.extend(coerce_written(op, &call.args, scopes));
+    Some(stmts)
 }
 
 /// `Move32Bool` or `Move32Int32`, by what the source register holds.
@@ -86,7 +118,7 @@ pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<Emit<'e>>
 /// Both C++ overloads take `(Register, Register)`, so the call says nothing; the
 /// model's two ops read the source with `getBool` and `getInt32` respectively, and
 /// which is right depends on the operand id the source was bound from.
-fn move32_op(args: &[CppSpanned<CppExpr>], scopes: &Scopes) -> Option<&'static str> {
+fn move32_op(args: &[CppTypedExpr], scopes: &Scopes) -> Option<&'static str> {
     let [src, _dst] = args else {
         return None;
     };
@@ -106,13 +138,13 @@ fn move32_op(args: &[CppSpanned<CppExpr>], scopes: &Scopes) -> Option<&'static s
 /// or 1; in the model it takes an op.
 fn coerce_written<'e>(
     op: &'static str,
-    args: &'e [CppSpanned<CppExpr>],
+    args: &'e [CppTypedExpr],
     scopes: &Scopes,
-) -> Option<Emit<'e>> {
+) -> Option<MasmStmt<'e>> {
     let (index, written) = writes(op)?;
     let dst = args.get(index)?;
     let declared = reg_kind(dst, scopes)?;
-    Some(Emit {
+    Some(MasmStmt::Emit {
         op: coercion(written, &declared.to_string())?,
         args: vec![dst],
     })
@@ -140,7 +172,7 @@ fn coercion(from: &str, to: &str) -> Option<&'static str> {
 }
 
 /// The operand id a register-valued argument was bound from.
-fn reg_kind<'s>(arg: &CppSpanned<CppExpr>, scopes: &'s Scopes) -> Option<&'s CachetPath> {
+fn reg_kind<'s>(arg: &CppTypedExpr, scopes: &'s Scopes) -> Option<&'s CachetPath> {
     let CppExpr::Ref(r) = &arg.value else {
         return None;
     };
@@ -149,25 +181,76 @@ fn reg_kind<'s>(arg: &CppSpanned<CppExpr>, scopes: &'s Scopes) -> Option<&'s Cac
 
 /// A `MacroAssembler` method to the op modeling it in `notes/masm.cachet`.
 ///
-/// Keyed on the method name alone, which is not enough in general: masm methods
-/// are overloaded on operand shape, and the model disambiguates in the op name.
-/// `branchTestNull` is four C++ overloads, of which the model has two --
-/// `BranchTestNull` for a `ValueOperand` and `BranchTestNullTag` for a tag
-/// `Register` -- and `load32` splits into `Load32Address` and friends. Only 45
-/// of the model's 106 ops are even the lowercased method name, so this stays a
-/// table, and the key grows an operand-type column when a second overload is
-/// first reached.
-fn translate_op(method: &str) -> Option<&'static str> {
-    Some(match method {
-        "branchTestNull" => "BranchTestNull",
-        "branchTestInt32" => "BranchTestInt32",
+/// Keyed on the method name and, where the model splits a method into several ops,
+/// the shape of its first operand -- which is what C++ overloads on. `moveValue` is
+/// the first to need it: `MoveValue` takes a register source, `MoveValueImm` a
+/// `Value`, and the call says which.
+///
+/// A `_` in the shape column does not mean the method has one overload, only that
+/// the model has one op for the overloads reached so far. `branchTestNull` is four
+/// C++ overloads against two model ops -- `BranchTestNull` for a `ValueOperand`,
+/// `BranchTestNullTag` for a tag `Register` -- and every emitter so far passes the
+/// former. Those rows want filling in as they are reached rather than guessed at.
+///
+/// Only 45 of the model's 106 ops are even the lowercased method name, so this stays
+/// a table either way.
+fn translate_op(method: &str, args: &[CppTypedExpr]) -> Option<&'static str> {
+    Some(match (method, operand_shape(args.first()).as_deref()) {
+        ("branchTestNull", _) => "BranchTestNull",
+        ("branchTestInt32", _) => "BranchTestInt32",
         // `Branch32Tag`, `Branch32Imm` and `Branch32AddressImm32` are the model's
-        // other three, all reached by a C++ overload this key cannot tell apart.
-        "branch32" => "Branch32",
+        // other three.
+        ("branch32", _) => "Branch32",
         // Templated on the source, `fallibleUnboxBoolean(const T&, Register,
-        // Label*)`. The model has the `ValueOperand` instantiation only, which is
-        // the one the emitters reach.
-        "fallibleUnboxBoolean" => "FallibleUnboxBoolean",
+        // Label*)`. The model has the `ValueOperand` instantiation only.
+        ("fallibleUnboxBoolean", _) => "FallibleUnboxBoolean",
+        // An unconditional branch to a label, which is an ordinary op: the label is
+        // its argument, unlike `bind`'s.
+        ("jump", _) => "Jump",
+        ("moveValue", Some("Value")) => "MoveValueImm",
+        ("moveValue", Some("ValueReg")) => "MoveValue",
         _ => return None,
     })
+}
+
+/// `movePtr(ImmWord(b), reg)` is `MovePtrBoolImmWord(b, reg)`.
+///
+/// The model has no generic `movePtr`. Its ops name both the immediate kind and what
+/// it carries -- `MovePtrBoolImmWord(b: Bool, ..)`, `MovePtrImmGCPtrObject(object:
+/// Object, ..)` -- so the C++'s `ImmWord` construction has nowhere to go and the
+/// value inside it is passed instead. The only masm mapping so far where choosing
+/// the op also rewrites an argument.
+fn move_ptr<'e>(
+    args: &'e [CppTypedExpr],
+) -> Option<(&'static str, Vec<&'e CppTypedExpr>)> {
+    let [imm, dst] = args else {
+        return None;
+    };
+    let CppExpr::Construct(c) = &imm.value else {
+        return None;
+    };
+    let [carried] = c.args.as_slice() else {
+        return None;
+    };
+    let op = match (
+        c.ty.scope.last()?.as_str(),
+        operand_shape(Some(carried))?.as_str(),
+    ) {
+        ("ImmWord", "Bool") => "MovePtrBoolImmWord",
+        _ => return None,
+    };
+    Some((op, vec![carried, dst]))
+}
+
+/// What the model calls the type of a masm operand, for the methods it splits by
+/// operand shape.
+///
+/// The Cachet spelling, since it is the model's own distinctions this has to line up
+/// with -- so it goes through [`translate_type`] rather than keeping a second table
+/// of the same C++ paths. `None` where the argument carries no readable type, or one
+/// the model has no name for.
+fn operand_shape(arg: Option<&CppTypedExpr>) -> Option<String> {
+    translate_type(arg?.ty.as_ref()?)
+        .ok()
+        .map(|ty| ty.to_string())
 }
