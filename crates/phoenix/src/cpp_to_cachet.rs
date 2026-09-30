@@ -29,6 +29,8 @@ use crate::cpp_subset::{
     Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
 };
 use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
+use crate::cachet_utils::emitted_ops;
+use crate::clang_utils::find_definition;
 use crate::masm_ops::{LABEL, MACRO_ASSEMBLER, MASM, MasmStmt, is_masm, masm_call};
 use crate::names::{NameMap, declared_names};
 use crate::scopes::{Obligation, Scopes};
@@ -2536,7 +2538,10 @@ fn translate_transitive_callees<'tu>(
     op_ir: OpIr,
     mut callees: Callees<'tu>,
     seed: State,
-    mut seen: HashSet<FnId>,
+    // Borrowed, so several passes over one module share it: a generator's helpers and
+    // its instructions' helpers overlap -- `JSOpToCondition` is reachable from
+    // several -- and Cachet has no overloading, so a second definition is an error.
+    seen: &mut HashSet<FnId>,
 ) -> (Vec<Spanned<Item>>, Vec<Gap>) {
     let mut gaps = seed.gaps;
     let mut queue: VecDeque<Needed> = seed.needed.into();
@@ -2642,10 +2647,10 @@ pub fn translate_fn_and_transitive_callees<'tu>(
 ) -> Result<(Vec<Spanned<Item>>, Vec<Gap>), Unhandled> {
     // Seeded with the definition itself, so one that reaches back into itself
     // isn't translated a second time.
-    let seen = HashSet::from([fn_def.name.id.clone()]);
+    let mut seen = HashSet::from([fn_def.name.id.clone()]);
     let (item, state) = translate_fn_def(ops, op_ir, class, &fn_def)?;
     let (mut items, gaps) =
-        translate_transitive_callees(ops, op_ir, fn_def.callees, state, seen);
+        translate_transitive_callees(ops, op_ir, fn_def.callees, state, &mut seen);
     items.push(Spanned::internal(Item::Fn(item)));
     Ok((items, gaps))
 }
@@ -2779,41 +2784,142 @@ pub fn translate_cacheir_op_and_helpers(
 ) -> Result<(CallableItem, Vec<Spanned<Item>>, Vec<Gap>), Error> {
     let ops = load_ops()?;
     let method = get_method_def(instruction)?;
-    // Seeded with the instruction itself, so an emitter that reaches back into
-    // itself isn't translated a second time.
-    let seen = HashSet::from([method.def.name.id.clone()]);
-    let (op, state) = translate_cacheir_op(&ops, op_ir, &method)?;
+    let mut seen = HashSet::new();
+    Ok(translate_op_sharing(&ops, op_ir, method, &mut seen)?)
+}
+
+/// One instruction, into a module that holds others.
+///
+/// `seen` is shared so the helpers do not repeat what a sibling op or the generator
+/// already defined.
+fn translate_op_sharing<'tu>(
+    ops: &Ops,
+    op_ir: OpIr,
+    method: MethodDef<'tu>,
+    seen: &mut HashSet<FnId>,
+) -> Result<(CallableItem, Vec<Spanned<Item>>, Vec<Gap>), Unhandled> {
+    // Inserted before translating, so an emitter that reaches back into itself is not
+    // translated a second time.
+    seen.insert(method.def.name.id.clone());
+    let (op, state) = translate_cacheir_op(ops, op_ir, &method)?;
     let (helpers, gaps) =
-        translate_transitive_callees(&ops, op_ir, method.def.callees, state, seen);
+        translate_transitive_callees(ops, op_ir, method.def.callees, state, seen);
     Ok((op, helpers, gaps))
 }
 
+/// Where a generator's CacheIR instructions are translated from.
+///
+/// A separate translation unit, because the generator's does not contain them: the
+/// unified build puts `CacheIR.cpp` in `Unified_cpp_js_src_jit2.cpp` and
+/// `CacheIRCompiler.cpp` in `..jit3.cpp`, so the emitters have to be parsed on their
+/// own.
+pub struct Instructions<'tu> {
+    /// The root of the translation unit holding `CacheIRCompiler::emit*`.
+    pub root: Entity<'tu>,
+    /// The file the real definitions are in, so the macro-generated
+    /// `emit<Op>(CacheIRReader&)` shim in `CacheIRCompiler.h` is not taken instead.
+    pub source: &'tu Path,
+}
+
+/// A stub generator as a module: the `ir` for the generator, every helper it calls,
+/// and -- given somewhere to translate them from -- the CacheIR ops it emits.
+///
+/// `instructions` is what decides between the two: with it, the ops are translated
+/// into an `ir CacheIROps` beside the model; without it, the generator emits into the
+/// hand-written `ir CacheIR` and the module leans on that.
 pub fn translate_generator(
     generator: &Entity<'_>,
-    op_ir: OpIr,
+    instructions: Option<Instructions<'_>>,
     imports: &Path,
 ) -> Result<Translation, Error> {
+    let op_ir = match instructions {
+        Some(_) => OpIr::Generated,
+        None => OpIr::Model,
+    };
     let ops = load_ops()?;
     let gen_def = get_method_def(generator)?;
     let unit = format!("{}::{}", gen_def.class, gen_def.def.name.name);
     let (ir, state) = translate_gen_def(&ops, op_ir, &gen_def)?;
 
+    // One `seen` across every pass over this module, so a helper two of them reach is
+    // defined once.
+    let mut seen = HashSet::from([gen_def.def.name.id.clone()]);
     // Each definition brings its own callees, so deeper helpers stay resolvable.
-    // Seeded with the generator itself, so a helper that calls back into it is
-    // not translated a second time.
-    let (helpers, gaps) = translate_transitive_callees(
+    let (gen_helpers, mut gaps) = translate_transitive_callees(
         &ops,
         op_ir,
         gen_def.def.callees,
         state,
-        HashSet::from([gen_def.def.name.id]),
+        &mut seen,
     );
 
+    // After the generator's pass, not before: the ops reached through a wrapper are
+    // only visible once `translate_transitive_callees` has synthesized it, and
+    // `LoadInt32Constant` is emitted nowhere else.
+    let mut op_items = Vec::new();
+    let mut op_helpers = Vec::new();
+    if let Some(instructions) = instructions {
+        let emitted = {
+            let items: Vec<_> = gen_helpers
+                .iter()
+                .cloned()
+                .chain([Spanned::internal(Item::Ir(ir.clone()))])
+                .collect();
+            emitted_ops(&items, op_ir.name())
+        };
+        for op in emitted {
+            match translate_instruction(&ops, op_ir, &instructions, &op, &mut seen) {
+                Ok((item, helpers, more)) => {
+                    op_items.push(Spanned::internal(Item::Op(item)));
+                    op_helpers.extend(helpers);
+                    gaps.extend(more);
+                }
+                Err(e) => {
+                    let what = format!("`{op}`: {}", e.what);
+                    op_helpers.push(note(what.clone()));
+                    gaps.push(Gap {
+                        fidelity: e.fidelity,
+                        what,
+                        span: e.span,
+                    });
+                }
+            }
+        }
+    }
+
+    let op_ir_item = (!op_items.is_empty()).then(|| {
+        Spanned::internal(Item::Ir(IrItem {
+            ident: Spanned::internal(Ident::from(op_ir.name())),
+            // An op emits machine code, as `ir CacheIR emits MASM` has it.
+            emits: Some(Spanned::internal(CachetPath::from_ident("MASM"))),
+            items: op_items,
+        }))
+    });
+
+    // Helpers before what needs them, and the ops before the generator that emits
+    // them.
     let module = verdict_items(&unit, &gaps)
         .into_iter()
         .chain(import_items(imports))
-        .chain(helpers)
+        .chain(op_helpers)
+        .chain(op_ir_item)
+        .chain(gen_helpers)
         .chain([Spanned::internal(Item::Ir(ir))])
         .collect();
     Ok(Translation { unit, module, gaps })
+}
+
+/// One `CacheIRCompiler::emit<Op>`, found by name in the instructions' unit.
+fn translate_instruction(
+    ops: &Ops,
+    op_ir: OpIr,
+    instructions: &Instructions<'_>,
+    op: &Ident,
+    seen: &mut HashSet<FnId>,
+) -> Result<(CallableItem, Vec<Spanned<Item>>, Vec<Gap>), Unhandled> {
+    let qualified = format!("CacheIRCompiler::emit{op}");
+    let entity = find_definition(instructions.root, &qualified, instructions.source)
+        .ok_or_else(|| Unhandled::new(format!("no definition of `{qualified}`")))?;
+    let method = get_method_def(&entity).map_err(|e| Unhandled::new(e.to_string()))?;
+    translate_op_sharing(ops, op_ir, method, seen)
 }

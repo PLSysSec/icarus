@@ -271,6 +271,11 @@ enum Cmd {
         /// model rather than against translated instructions.
         #[arg(long)]
         model_ops: bool,
+        /// Source file the `CacheIRCompiler::emit*` instructions are defined in.
+        /// Its own translation unit: a generator's does not contain them, and the
+        /// unified build does not put them together either.
+        #[arg(long, default_value = "js/src/jit/CacheIRCompiler.cpp")]
+        instruction_source: PathBuf,
     },
     /// Dump the generator lowered into the modeled C++ subset.
     Subset { symbol: String },
@@ -340,6 +345,7 @@ fn main() {
             imports,
             unit,
             model_ops,
+            instruction_source,
             ..
         } => {
             let op_ir = if *model_ops {
@@ -405,8 +411,21 @@ fn main() {
                     }
                 }
             } else {
-                // The generator plus every helper it calls.
-                match phoenix::cpp_to_cachet::translate_generator(&def, op_ir, imports) {
+                // The instructions are in their own translation unit, so parse it --
+                // but only when the ops are being translated, since it costs a second
+                // clang run.
+                let instruction_tu = (op_ir == OpIr::Generated)
+                    .then(|| parse_file(&index, instruction_source, &db));
+                let instructions =
+                    instruction_tu
+                        .as_ref()
+                        .map(|tu| phoenix::cpp_to_cachet::Instructions {
+                            root: tu.get_entity(),
+                            source: instruction_source,
+                        });
+
+                // The generator plus every helper it calls, and its ops.
+                match phoenix::cpp_to_cachet::translate_generator(&def, instructions, imports) {
                     Ok(translation) => {
                         write_out(out.as_deref(), &format!("{}\n", translation.module));
                         // Nonzero on a partial translation, so a shell chain
