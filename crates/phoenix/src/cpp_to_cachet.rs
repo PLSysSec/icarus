@@ -1466,6 +1466,27 @@ fn translate_stmt_values(
             // `writer.returnFromIC()` call, not from returning `Attach`.
             let value = if ctx.is_stub_generator() {
                 None
+            } else if ctx.instruction.is_some() {
+                // An instruction's `bool` is protocol with the compiler loop --
+                // `true` means the code was emitted, `false` that it gave up -- and
+                // the model has neither notion, so the value goes while the `return`
+                // stays, an early one being real control flow.
+                //
+                // Keyed on `instruction` rather than on the class, which would also
+                // catch a `CacheIRCompiler` method translated as a plain helper.
+                //
+                // `false` is refused rather than read as success: the out-of-memory
+                // path from `addFailurePath` is consumed by its own idiom, so a
+                // `false` arriving here is something the model cannot express, and
+                // calling it success would verify a path that does not exist.
+                match ret.value.as_ref().map(|v| &v.value) {
+                    None | Some(CppExpr::Lit(CppLit::Bool(true))) => None,
+                    Some(_) => {
+                        return Err(Unhandled::new(String::from(
+                            "an instruction returning anything but `true`",
+                        )));
+                    }
+                }
             } else {
                 ret.value
                     .as_ref()

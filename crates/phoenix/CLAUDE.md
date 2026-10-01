@@ -1,0 +1,112 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+phoenix translates SpiderMonkey's CacheIR stub generators and instructions from C++
+into Cachet, so that what gets verified is derived from the engine rather than
+written by hand. `README.md` covers setup, env overrides and the full CLI; this file
+covers what is hard to rediscover.
+
+## Commands
+
+```sh
+cargo build -p phoenix          # -p is required; the workspace has several binaries
+cargo test -q -p phoenix
+cargo test -p phoenix a_claim   # one test, by substring
+
+# translate: a generator, one instruction, a free function
+cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32'
+cargo run -p phoenix -- cachet --unit instruction \
+  --source js/src/jit/CacheIRCompiler.cpp 'CacheIRCompiler::emitGuardIsNull'
+cargo run -p phoenix -- cachet --unit function 'CanConvertToInt32ForToNumber'
+
+# inspect: the modeled C++ subset, the raw clang AST, the call graph
+cargo run -p phoenix -- subset 'CompareIRGenerator::tryAttachInt32'
+cargo run -p phoenix -- ast 'CompareIRGenerator::tryAttachInt32'
+
+# translate, compile and verify; one line per stub
+./scripts/translate-verify.sh CompareIRGenerator
+```
+
+To check generated Cachet by hand, copy `notes/*.cachet` somewhere writable, write
+the module beside them with `--imports .`, and run the compiler directly:
+
+```sh
+cargo run --bin cachet-compiler -- gen.cachet \
+  --cpp-decls g.h --cpp-defs g.inc --bpl g.bpl
+```
+
+## Pipeline
+
+clang AST → `cpp_subset` (a small, explicitly modeled C++) → `cpp_to_cachet` →
+`cachet_lang::parser` AST → **printed as text**.
+
+That last step is load-bearing, not incidental. phoenix emits source that the Cachet
+parser re-reads, which is how a label argument works at all: we emit
+`Expr::Var(ifTrue)`, the parser turns a bare name in argument position into
+label-or-variable, and name resolution settles it against the op's signature —
+something phoenix cannot do, since it never reads the model. `failure.label_` relies
+on the same round-trip. Handing `cachet-compiler` an AST in process would break both.
+
+Two failure vocabularies, and the messages say which:
+
+| | means | where |
+|---|---|---|
+| `Unsupported` | the C++ never reached the subset | `cpp_subset` |
+| `Unhandled` | it did, and the model has no counterpart | `cpp_to_cachet` |
+
+`Fidelity` grades a gap: `Elided` (sound to drop), `Failed` (phoenix cannot express
+it), `Invalid` (the C++ breaks an invariant both languages rely on — likelier a
+misreading on our side, which is why it is reported rather than asserted). Anything
+but `Elided` blocks verification.
+
+## Modules
+
+- `cacheir_ops` — `CacheIROps.yaml` is the authority on what a CacheIR op *is*:
+  operand names, types, which are stub fields, the writer-method naming rules, and
+  wrapper synthesis. `OpIr` picks the `ir` generated ops live in (`CacheIROps`) or
+  the hand-written one (`CacheIR`, via `--model-ops`).
+- `masm_ops` — the MacroAssembler correspondence. No yaml exists for masm, so this
+  is a hand-written table; `MasmStmt` lets one C++ call become several statements, or
+  a `bind` rather than an `emit`.
+- `scopes` — per-block facts the C++ does not state: what kind of value a register
+  holds, and outstanding failure paths as `Obligation`s discharged on return or at
+  scope end.
+- `names` — every C++ name to its Cachet identifier, decided per unit so a
+  keyword-mangled name cannot land on one already in use.
+- `cachet_utils` — walks phoenix's *own output*; `emitted_ops` reads the op set a
+  generator needs off the emits it produced.
+- `cpp_to_cachet` — the translator. `translate_known_expr`, `translate_known_stmt` and
+  `translate_known_block` are the special-case boundary: an idiom lives in one of the
+  three, a plain C++ form lives in the ordinary match. Keep it that way.
+
+A generator and its instructions are in **different translation units** —
+`CacheIR.cpp` lands in `Unified_cpp_js_src_jit2.cpp`, `CacheIRCompiler.cpp` in
+`..jit3.cpp` — so the emitters are parsed separately (`--instruction-source`).
+
+## Working rules
+
+**The C++ is ground truth.** `notes/*.cachet` is a careful hand-written model, but it
+was written against an older Firefox and can be dated. When the two disagree, suspect
+the model first and check the C++.
+
+**Refuse rather than guess.** A wrong mapping verifies something other than the code
+that runs, which is worse than not verifying. Every refusal becomes a gap with a
+span, and the output carries a `DO NOT VERIFY` header.
+
+**Ask whether a mistake would be loud.** The recurring hazard is a name resolving to
+the wrong thing rather than to nothing: Cachet accepts shadowing silently, so a
+rename that collides is invisible, while an unknown qualified name (`JSOp::NotAThing`)
+is rejected outright. A derived rule is fine where a miss is loud; where it is silent,
+use a table and check the collision.
+
+**Measure instead of asserting.** Several design decisions here rest on counts taken
+from the source — 18/18 stub-field arg types end in `Field`, 514 of 522
+`allocator.use*`/`define*` calls are declaration initializers, 27 arg types map to 27 distinct
+Cachet types. Write the number and where it came from into the doc comment.
+
+**A `complete` verdict does not mean it compiles.** The fidelity report measures what
+the walk handled, not whether the result type checks. Run `cachet-compiler` before
+claiming a translation works.
+
+`notes/` is not to be edited. Deferred findings go in `scratch/claude/notes/`.

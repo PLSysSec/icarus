@@ -70,6 +70,24 @@ cargo run -p phoenix -- calls 'SetPropIRGenerator::tryAttachNativeSetSlot' --dep
 function becomes a `fn`. Its `--imports` is where the generated `import`s point,
 relative to `--out`; the default suits `notes/stubs/`.
 
+A generator's module also holds the CacheIR ops it emits, translated into an
+`ir CacheIROps` beside the imported `ir CacheIR` — the model's `fn`s are still
+imported, only the ops are generated. `--model-ops` leaves them to the
+hand-written model instead, so the generator emits into `ir CacheIR` and nothing
+below it is translated:
+
+```sh
+# the generator, its helpers, and the ops it emits
+cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32'
+
+# ...against the hand-written ops in notes/cacheir.cachet
+cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32' --model-ops
+```
+
+The ops come from their own translation unit, named by `--instruction-source`
+(default `js/src/jit/CacheIRCompiler.cpp`): a generator's unit does not contain
+them, and the unified build does not put them together either.
+
 `--source` and `--db` are global and may go before or after the subcommand.
 `--source` is matched as a path suffix against the compile database, and
 defaults to `js/src/jit/CacheIR.cpp`; reach for it when the symbol lives
