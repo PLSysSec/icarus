@@ -39,14 +39,14 @@ cargo run --bin cachet-compiler -- gen.cachet \
 ## Pipeline
 
 clang AST → `cpp_subset` (a small, explicitly modeled C++) → `cpp_to_cachet` →
-`cachet_lang::parser` AST → **printed as text**.
+`cachet_lang::parser` AST → printed as text.
 
-That last step is load-bearing, not incidental. phoenix emits source that the Cachet
-parser re-reads, which is how a label argument works at all: we emit
-`Expr::Var(ifTrue)`, the parser turns a bare name in argument position into
-label-or-variable, and name resolution settles it against the op's signature —
-something phoenix cannot do, since it never reads the model. `failure.label_` relies
-on the same round-trip. Handing `cachet-compiler` an AST in process would break both.
+Build arguments with `cachet_utils::to_arg`, never `Arg::Expr` directly. A bare name
+and a field access in argument position are *ambiguous* in Cachet — either could be a
+label — and the grammar defers the choice to name resolution, which knows the callee's
+signature. phoenix does not, since it never reads the model. `to_arg` reproduces that
+normalization, so the AST phoenix builds is the one the parser would have built, and
+nothing depends on the output being re-read.
 
 Two failure vocabularies, and the messages say which:
 
@@ -109,4 +109,31 @@ Cachet types. Write the number and where it came from into the doc comment.
 the walk handled, not whether the result type checks. Run `cachet-compiler` before
 claiming a translation works.
 
-`notes/` is not to be edited. Deferred findings go in `scratch/claude/notes/`.
+`notes/` — the hand-written model at the repo root — is not to be edited.
+
+`docs/` holds the design record: what is deferred and why, with the measurements
+behind each decision. `docs/README.md` indexes it. Read `docs/next-steps.md` first
+after a compaction — it is a dated snapshot of what works, what blocks it, and what is
+left. Add to these rather than re-deriving, and say so when one goes stale.
+
+## How this is developed
+
+**Discuss before changing.** Most work here happens a construct at a time, with the
+design settled in conversation first. Expect to explain what a change does and why,
+and to be asked about it — "is that actually allowed?", "what does the C++ do?" —
+before anything is written. A change to a table's shape, a function signature, or
+where a decision lives is worth raising rather than just making.
+
+**Settle questions by experiment.** Several designs here were decided by running a
+three-line `.cachet` file through `cachet-compiler`: whether an `ir` can be declared
+twice, whether an `impl` can extend one, whether a reserved word parses as a parameter
+name, whether shadowing is accepted. That is faster and more reliable than reasoning
+about the language, and the answer belongs in a doc comment afterwards.
+
+Prefer the `Edit` tool over `sed`/`python` for file changes, unless auto mode is on
+and asks for the shell.
+
+**Propose fixes when this file drifts.** When the code no longer matches this file or
+`README.md` — a renamed flag, a module whose job has moved, an invariant that no
+longer holds — say so and offer the edit. Both are read fresh after a compaction, so a
+stale claim here is worse than a missing one.

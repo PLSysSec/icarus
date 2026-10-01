@@ -8,7 +8,7 @@ use cachet_lang::ast::{
 use cachet_lang::ast::{CheckKind, NegateKind};
 use cachet_lang::parser::{
     FieldAccess,
-    Arg, BinOperExpr, BindStmt, Block, Call, CallableItem, CheckStmt, Comment, ElseClause, Expr,
+    BinOperExpr, BindStmt, Block, Call, CallableItem, CheckStmt, Comment, ElseClause, Expr,
     GlobalVarItem,
     IfStmt as CachetIfStmt, ImportItem, IrItem, Item, Label as CachetLabel, LabelStmt, LetStmt,
     Literal, LocalVar, Mod, NegateExpr,
@@ -29,7 +29,7 @@ use crate::cpp_subset::{
     Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
 };
 use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
-use crate::cachet_utils::emitted_ops;
+use crate::cachet_utils::{emitted_ops, to_arg};
 use crate::clang_utils::find_definition;
 use crate::masm_ops::{LABEL, MACRO_ASSEMBLER, MASM, MasmStmt, is_masm, masm_call};
 use crate::names::{NameMap, declared_names};
@@ -495,7 +495,7 @@ fn translate_preamble(
             target: Spanned::internal(
                 CachetPath::from_ident("JSOp").nest(Ident::from(predicate.to_owned())),
             ),
-            args: Spanned::internal(vec![Spanned::internal(Arg::Expr(op_field.clone()))]),
+            args: Spanned::internal(vec![Spanned::internal(to_arg(op_field.clone()))]),
         })
     };
     stmts.push(Spanned::internal(Stmt::Check(CheckStmt {
@@ -879,7 +879,7 @@ fn translate_retype(
         target: Spanned::internal(
             CachetPath::from_ident("OperandId").nest(Ident::from(format!("to{ty}"))),
         ),
-        args: Spanned::internal(vec![Spanned::internal(Arg::Expr(translate_expr(
+        args: Spanned::internal(vec![Spanned::internal(to_arg(translate_expr(
             ctx, state, recv,
         )?))]),
     }))
@@ -1096,7 +1096,7 @@ fn translate_allocator_register(
         target: Spanned::internal(
             CachetPath::from_ident("CacheIR").nest(Ident::from(target.to_owned())),
         ),
-        args: Spanned::internal(vec![Spanned::internal(Arg::Expr(translate_expr(
+        args: Spanned::internal(vec![Spanned::internal(to_arg(translate_expr(
             ctx, state, id,
         )?))]),
     });
@@ -1317,7 +1317,7 @@ fn translate_expr_value(
                 .args
                 .iter()
                 .map(|arg| {
-                    Ok(Spanned::internal(Arg::Expr(translate_expr(
+                    Ok(Spanned::internal(to_arg(translate_expr(
                         ctx, state, arg,
                     )?)))
                 })
@@ -1347,14 +1347,14 @@ fn translate_expr_value(
                 // one is no value at all, so there is nothing to pass.
                 let mut args = Vec::new();
                 if translate_type(recv_ty).is_ok() {
-                    args.push(Spanned::internal(Arg::Expr(translate_expr(
+                    args.push(Spanned::internal(to_arg(translate_expr(
                         ctx, state, recv,
                     )?)));
                 }
                 // An ambient entity is no value in the model, so where C++ hands
                 // one along -- `useValueRegister(masm, inputId)` -- it is dropped.
                 for arg in call.args.iter().filter(|arg| !is_ambient_expr(arg)) {
-                    args.push(Spanned::internal(Arg::Expr(translate_expr(
+                    args.push(Spanned::internal(to_arg(translate_expr(
                         ctx, state, arg,
                     )?)));
                 }
@@ -1381,7 +1381,7 @@ fn translate_expr_value(
                     // An ambient entity isn't a value, so it isn't passed.
                     .filter(|arg| !is_ambient_expr(arg))
                     .map(|arg| {
-                        Ok(Spanned::internal(Arg::Expr(translate_expr(
+                        Ok(Spanned::internal(to_arg(translate_expr(
                             ctx, state, arg,
                         )?)))
                     })
@@ -1702,7 +1702,7 @@ fn translate_known_stmt(
                 .args
                 .iter()
                 .map(|arg| {
-                    Ok(Spanned::internal(Arg::Expr(translate_expr(
+                    Ok(Spanned::internal(to_arg(translate_expr(
                         ctx, state, arg,
                     )?)))
                 })
@@ -1744,10 +1744,10 @@ fn translate_known_stmt(
                     CachetPath::from_ident("CacheIR").nest(Ident::from(loader.to_owned())),
                 ),
                 args: Spanned::internal(vec![
-                    Spanned::internal(Arg::Expr(Expr::Var(Spanned::internal(
+                    Spanned::internal(to_arg(Expr::Var(Spanned::internal(
                         CachetPath::from_ident(field),
                     )))),
-                    Spanned::internal(Arg::Expr(translate_expr(ctx, state, dst)?)),
+                    Spanned::internal(to_arg(translate_expr(ctx, state, dst)?)),
                 ]),
             })))]
         }
@@ -1776,7 +1776,7 @@ fn translate_known_stmt(
                         let args = args
                             .iter()
                             .map(|arg| {
-                                Ok(Spanned::internal(Arg::Expr(translate_expr(
+                                Ok(Spanned::internal(to_arg(translate_expr(
                                     ctx, state, arg,
                                 )?)))
                             })

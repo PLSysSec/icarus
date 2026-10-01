@@ -1,4 +1,4 @@
-//! Reading back the Cachet phoenix has written.
+//! Working with the Cachet AST phoenix writes and reads back.
 //!
 //! `cachet-lang` has no traversal to borrow: each compiler pass descends by hand over
 //! its own stage's AST (`type_checker.rs`, `normalizer.rs`, `flattener.rs`), and none
@@ -10,7 +10,30 @@
 use std::collections::BTreeSet;
 
 use cachet_lang::ast::{Ident, Path as CachetPath, Spanned};
-use cachet_lang::parser::{Block, Call, ElseClause, IfStmt, Item, Stmt};
+use cachet_lang::parser::{Arg, Block, Call, ElseClause, Expr, FreeArg, IfStmt, Item, Stmt};
+
+/// An argument, normalized as the parser normalizes one.
+///
+/// Why this exists rather than `Arg::Expr` everywhere: a bare name and a field access
+/// in argument position are *ambiguous* in Cachet -- either could be a label -- and
+/// the grammar (grammar.lalrpop:177) defers the choice to name resolution, which knows
+/// the callee's signature. phoenix does not: it never reads the model, so it cannot
+/// tell which parameters are labels.
+///
+/// Building `Arg::Expr(Expr::Var(..))` instead would assert "variable" in a position
+/// the language leaves open. It happens to work only because phoenix emits text that
+/// the parser re-reads and re-normalizes; producing the same nodes the parser would
+/// makes that round-trip incidental rather than load-bearing.
+pub fn to_arg(expr: Expr) -> Arg {
+    match expr {
+        Expr::Var(path) => Arg::Free(FreeArg {
+            path,
+            is_out: false,
+        }),
+        Expr::FieldAccess(field_access) => Arg::FieldAccess(*field_access),
+        expr => Arg::Expr(expr),
+    }
+}
 
 pub trait Visit {
     fn visit_item(&mut self, item: &Item) {

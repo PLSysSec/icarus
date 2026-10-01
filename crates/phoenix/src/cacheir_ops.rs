@@ -17,6 +17,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::cpp_to_cachet::Unhandled;
+use crate::cachet_utils::to_arg;
 use crate::names::is_reserved;
 
 /// The name of an op argument's type, e.g. `ValId`, `RawInt32Field`, `JSOpImm`.
@@ -599,7 +600,7 @@ pub fn create_op_wrapper(op: &Op, ir: OpIr) -> Result<CallableItem, Unhandled> {
         if name == "result" {
             let result = param_ident(name);
             stmts.push(let_stmt(result, cache_ir_call(allocator, Vec::new())));
-            args.push(Spanned::internal(Arg::Expr(var_expr(result))));
+            args.push(Spanned::internal(to_arg(var_expr(result))));
             continue;
         }
         match field_writer(ty) {
@@ -611,12 +612,12 @@ pub fn create_op_wrapper(op: &Op, ir: OpIr) -> Result<CallableItem, Unhandled> {
                     field,
                     cache_ir_call(
                         writer,
-                        vec![Spanned::internal(Arg::Expr(var_expr(param_ident(name))))],
+                        vec![Spanned::internal(to_arg(var_expr(param_ident(name))))],
                     ),
                 ));
-                args.push(Spanned::internal(Arg::Expr(var_expr(field))));
+                args.push(Spanned::internal(to_arg(var_expr(field))));
             }
-            None => args.push(Spanned::internal(Arg::Expr(var_expr(param_ident(name))))),
+            None => args.push(Spanned::internal(to_arg(var_expr(param_ident(name))))),
         }
     }
 
