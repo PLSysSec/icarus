@@ -704,6 +704,7 @@ fn translate_method(recv: &CppType, method: &str) -> Option<(&'static str, &'sta
         (_, Some("Value"), "isBoolean") => Some(("Value", "isBool")),
         (_, Some("Value"), "isNull") => Some(("Value", "isNull")),
         (_, Some("Value"), "isNullOrUndefined") => Some(("Value", "isNullOrUndefined")),
+        (_, Some("Value"), "isBigInt") => Some(("Value", "isBigInt")),
 
         // Whether the result register holds a boxed value rather than an unboxed one
         // of a known type (notes/masm.cachet:182). Keyed on the Cachet type so an

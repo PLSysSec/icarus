@@ -1,46 +1,57 @@
 # Where `tryAttachInt32` stands, and what is left
 
-Status: written 2026-10-01, at the point where a generator's module holds its own
-translated CacheIR ops. Verified by running the commands below, not from memory.
+Status: written 2026-10-01, updated 2026-10-02 when the first stub verified end to end.
+Measured by running the commands below, not from memory.
 
 ## Confirmed state
 
 ```sh
-cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32' \
-  --imports . --out <dir>/gen.cachet      # with notes/*.cachet copied into <dir>
-cargo run --bin cachet-compiler -- <dir>/gen.cachet \
-  --cpp-decls <dir>/g.h --cpp-defs <dir>/g.inc --bpl <dir>/g.bpl
+./scripts/translate-verify.sh CompareIRGenerator
 ```
 
-phoenix says `complete, 12 elided`. The module holds, in order: imports, the ops'
-helpers (`JSOpToCondition`, `EmitStoreBoolean`), `ir CacheIROps` with the five ops it
-emits, the generator's helpers and wrappers, then `ir CompareIRGenerator`.
+`CompareIRGenerator::tryAttachInt32` reports **`PASS … verified`**: phoenix says
+`complete, 12 elided`, `cachet-compiler` accepts it, and Corral says *"Program has no
+bugs."* The module holds, in order: imports, the ops' helpers (`JSOpToCondition`,
+`EmitStoreBoolean`), `ir CacheIROps` with the five ops it emits, the generator's helpers
+and wrappers, then `ir CompareIRGenerator`.
 
-`cachet-compiler` reports **one** error, in `fn JSOpToCondition`. Every one of the five
-ops type checks. 22 tests pass.
+Across the class: **1 verified, 9 partial, 4 broken** — and every failure is now in
+*translation*, phoenix's own gaps. Nothing fails to compile or verify. 22 phoenix tests
+pass.
 
-## The blocker
+## How the divergence blocker was resolved
 
-`JSOpToCondition`'s `switch` has a `default: MOZ_CRASH(..)`, which translates to
-`assert false`. That is a check, not a return, so the function can fall off its end and
-the return type is unsatisfied.
+`JSOpToCondition`'s `switch` has a `default: MOZ_CRASH(..)`. That used to translate to
+`assert false`, which is a check rather than a return, so a value-returning function
+could fall off its end and its return type went unsatisfied.
 
-Cachet has no diverging construct — nothing matching `unreachable`, `never`, `noreturn`
-in `built_in.rs`, and no use of the idea anywhere in `notes/*.cachet`. So this wants
-either:
+Cachet now has **`unreachable`** as a statement, and `MOZ_CRASH` translates to it. The
+reason string is kept as a comment. It is one statement in every AST from the parser
+down, and each pass gives it the obvious meaning:
 
-- **a Cachet change**, e.g. an expression or statement that type checks as diverging.
-  In Boogie terms it would lower to `assert false; assume false;` — the assert keeps
-  the unreachability an obligation, the assume makes the path dead. This is the
-  direction Kyle preferred thinking about.
-- **the default-arm fold**, which I implemented and then reverted at his request: when
-  a switch's `default` crashes, move the last case into the final `else` as
-  `assert <that case's condition>; <its body>`. Sound, and exactly what the
-  hand-written `Condition::fromJSOp` does by hand (notes/masm.cachet:624). Rejected as
-  too clever for now, not as wrong.
+| pass | behavior |
+|---|---|
+| type checker | sets `Block::exits_early`, like `return` |
+| Boogie | `assert false; return;` — the assert keeps the obligation, the valueless return leaves `ret` unconstrained |
+| C++ | `Cachet_Unreachable()`, which the embedder defines as a `[[noreturn]]` crash |
+| flow tracer | drains into the exit state and `Break`s, like `Stmt::Ret` |
 
-**Unknown beyond that: whether the module verifies.** Compilation has never succeeded,
-so Boogie has never seen it.
+Two alternatives were considered and rejected. **Reinterpreting `assert false`** as
+diverging works, but it reads the control-flow fact out of a syntactic accident, and it
+changes the lowering of every existing `assert false` in `notes/` — measured: doing so
+makes `op AssumeUnreachable` trip `trace_body`'s assertion. **The default-arm fold** —
+moving a switch's last case into the final `else` under an `assert` — was implemented and
+reverted earlier; sound, but it hides the obligation in a rewrite.
+
+Things settled along the way, worth not re-deriving:
+
+- `assert false` alone does *not* make a Boogie path dead, but it does not need to.
+  If the path is reachable Corral reports the failed assertion; if not, it contributes
+  nothing. So no `assume false` is emitted.
+- `RetStmt { value: None }` already means "returns unit" (`normalizer.rs:428`), which is
+  why `unreachable` is its own statement rather than a valueless return.
+- A reachable `unreachable` *does* fail verification — `tests/verifier/fail/unreachable.cachet`
+  pins that, so the construct cannot be used as an escape hatch.
 
 ## Smaller things, roughly by value
 
@@ -70,6 +81,13 @@ so Boogie has never seen it.
   enclosing `ir`, and that path emits bare items. Fine for inspection.
 - **`op_sig` / `op_params` are test-only**, dead on the translation path since
   `translate_cacheir_op` started building its own signature.
+- **`scripts/test.sh` does not run as-is**, which is easy to mistake for a passing suite:
+  it needs GNU `parallel` (absent on this machine — it reports "0 tests passed, 9 tests
+  skipped" rather than failing), and it invokes `cachet-compiler` with positional output
+  paths, which the CLI replaced with `--cpp-decls`/`--cpp-defs`/`--bpl`. Run the stages
+  directly until it's fixed. Baseline when last measured: 6 of 21 cases fail
+  (`cpp/numerics`, `dual/structs`, `frontend/pass/imports`, `verifier/fail/early_return`,
+  `verifier/fail/structs`, `verifier/pass/numerics`), all pre-existing.
 - **The integer-literal change is stricter than before.** A literal whose C++ type has
   no `translate_type` row is now refused rather than defaulted to `Int32`. A sweep over
   emitters for newly-refused literals was started and abandoned; no known instances.

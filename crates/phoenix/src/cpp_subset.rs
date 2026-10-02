@@ -1276,6 +1276,66 @@ fn is_construction(e: Entity) -> bool {
     e.get_reference().map(|r| r.get_kind()) == Some(EntityKind::Constructor)
 }
 
+/// The arguments actually written at the call site, dropping any left to a
+/// default.
+///
+/// A parameter left to its default still arrives as an argument:
+/// `AutoScratchRegister scratch(allocator, masm)` reaches us with three, the
+/// third standing for `Register reg = InvalidReg`. Dropping it is what the
+/// translation needs rather than a convenience -- the two-argument form means
+/// `allocateRegister` and the three-argument form `allocateFixedRegister`.
+///
+/// LIBCLANG: `CXXDefaultArgExpr` has no cursor kind of its own (libclang 22 has
+/// no `CXXDefaultArg` symbol at all, and no API to ask), so it arrives as a
+/// childless `UnexposedExpr`, whatever the default's own form -- measured on a
+/// `Reg` default spelled as a constructor call and an `int` default spelled as a
+/// literal, both of which flatten the same way. That shape alone would be a
+/// guess, so it is corroboration and the decision rests on two facts libclang
+/// does answer exactly:
+///
+///   * the callee's parameter at this position has a default, which shows up as a
+///     non-type child of its `ParmDecl`;
+///   * nothing was written here, clang giving a default argument an invalid
+///     source location precisely because there is no source text for it. A
+///     written argument always has a range, including one from a macro expansion.
+///
+/// Plus one invariant from the language: defaults can only be trailing, so what
+/// is dropped must be a suffix of the argument list.
+///
+/// Every check that fails *keeps* the argument, which then meets the ordinary
+/// refusal for its node kind. So a misread costs a reported gap, never a
+/// silently discarded argument.
+fn written_args<'tu>(target: Option<Entity<'tu>>, args: &[Entity<'tu>]) -> Vec<Entity<'tu>> {
+    let params = target.and_then(|t| t.get_arguments());
+    let is_defaulted = |i: usize, a: &Entity<'tu>| {
+        a.get_kind() == EntityKind::UnexposedExpr
+            && a.get_children().is_empty()
+            && a.get_range().is_none()
+            && params.as_ref().is_some_and(|params| {
+                params
+                    .get(i)
+                    .is_some_and(|p| p.get_children().into_iter().any(|c| !is_type_ref(c)))
+            })
+    };
+
+    // The first position that looks defaulted, and every position after it. A
+    // written argument past that point means the reading is wrong, so nothing is
+    // dropped at all.
+    let from = args
+        .iter()
+        .enumerate()
+        .position(|(i, a)| is_defaulted(i, a))
+        .unwrap_or(args.len());
+    if !args[from..]
+        .iter()
+        .enumerate()
+        .all(|(n, a)| is_defaulted(from + n, a))
+    {
+        return args.to_vec();
+    }
+    args[..from].to_vec()
+}
+
 fn extract_construct(e: Entity) -> Result<Construct> {
     let ty = e.get_type().ok_or_else(|| Unsupported::Malformed {
         what: format!(
@@ -1287,8 +1347,7 @@ fn extract_construct(e: Entity) -> Result<Construct> {
     Ok(Construct {
         ty: type_of(ty, e)?,
         // Every child is an argument; there is no callee to skip.
-        args: e
-            .get_children()
+        args: written_args(e.get_reference(), &e.get_children())
             .into_iter()
             .map(extract_expr)
             .collect::<Result<Vec<_>>>()?,
@@ -1361,9 +1420,9 @@ fn extract_call(e: Entity) -> Result<Call> {
         _ => return Err(Unsupported::Callee { name, loc: loc(e) }),
     };
 
-    let args = args
-        .iter()
-        .map(|a| extract_expr(*a))
+    let args = written_args(Some(target), args)
+        .into_iter()
+        .map(extract_expr)
         .collect::<Result<Vec<_>>>()?;
     Ok(Call { callee, args })
 }
