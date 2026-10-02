@@ -14,8 +14,8 @@ use typed_index_collections::TiVec;
 
 use crate::FrontendError;
 use crate::ast::{
-    ArithBinOper, BinOper, BlockKind, CastSafety, CompareBinOper, Ident, MaybeSpanned, NegateKind,
-    Path, Span, Spanned, VarParamKind,
+    ArithBinOper, BinOper, BlockKind, CastSafety, CheckKind, CompareBinOper, Ident, MaybeSpanned,
+    NegateKind, Path, Span, Spanned, VarParamKind,
 };
 use crate::built_in::{BuiltInType, BuiltInVar, IdentEnum, Signedness, Width};
 use crate::resolver;
@@ -1837,8 +1837,24 @@ fn does_stmt_exit_early(stmt: &Stmt) -> bool {
         Stmt::If(if_stmt) => does_if_stmt_exit_early(if_stmt),
         Stmt::ForIn(for_in_stmt) => for_in_stmt.body.exits_early,
         Stmt::Ret(_) => true,
-        Stmt::Label(_) | Stmt::Check(_) | Stmt::Goto(_) | Stmt::Bind(_) | Stmt::Emit(_) => false,
+        Stmt::Check(check_stmt) => does_check_stmt_exit_early(check_stmt),
+        Stmt::Label(_) | Stmt::Goto(_) | Stmt::Bind(_) | Stmt::Emit(_) => false,
     }
+}
+
+// Treat `assert false` as an early exit
+fn does_check_stmt_exit_early(check_stmt: &CheckStmt) -> bool {
+    check_stmt.kind == CheckKind::Assert && is_false(&check_stmt.cond)
+}
+
+fn is_false(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Var(VarExpr {
+            var: VarIndex::BuiltIn(BuiltInVar::False),
+            ..
+        })
+    )
 }
 
 fn does_if_stmt_exit_early(if_stmt: &IfStmt) -> bool {
