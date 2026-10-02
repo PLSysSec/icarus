@@ -104,6 +104,7 @@ pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
         | Stmt::Goto(_)
         | Stmt::Bind(_)
         | Stmt::Ret(_)
+        | Stmt::Unreachable
         | Stmt::Expr(_) => {}
     }
 }

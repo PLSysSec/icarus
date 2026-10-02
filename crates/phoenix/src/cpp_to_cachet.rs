@@ -1542,9 +1542,9 @@ fn translate_stmt_values(
                 None => Vec::new(),
             })
         }
-        // `MOZ_CRASH("..")` says control never reaches here. The model states that
-        // as a proof obligation rather than a runtime abort, so the verifier has to
-        // show the point really is unreachable.
+        // `MOZ_CRASH("..")` says control never reaches here, which is exactly
+        // `unreachable`. The reason string has no counterpart, so it is kept as a
+        // comment.
         CppStmt::Crash(c) => {
             let mut stmts = Vec::new();
             if let Some(reason) = &c.reason {
@@ -1552,12 +1552,7 @@ fn translate_stmt_values(
                     text: format!("MOZ_CRASH({reason:?})"),
                 })));
             }
-            stmts.push(Spanned::internal(Stmt::Check(CheckStmt {
-                kind: CheckKind::Assert,
-                cond: Spanned::internal(Expr::Var(Spanned::internal(CachetPath::from_ident(
-                    "false",
-                )))),
-            })));
+            stmts.push(Spanned::internal(Stmt::Unreachable));
             Ok(stmts)
         }
         // Cachet's `let` always binds a value, so a C++ declaration without an

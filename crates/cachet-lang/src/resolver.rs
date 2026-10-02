@@ -978,6 +978,7 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
             parser::Stmt::Ret(ret_stmt) => {
                 self.resolve_ret_stmt(ret_stmt).map(Stmt::from).map(Some)
             }
+            parser::Stmt::Unreachable => Some(Some(Stmt::Unreachable)),
             parser::Stmt::Expr(expr) => self.resolve_expr(expr).map(Stmt::from).map(Some),
         }
     }

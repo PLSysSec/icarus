@@ -22,7 +22,7 @@ use crate::cpp_subset::{CompoundStmt, Param, Stmt, Visit, walk_stmt};
 const RESERVED: &[&str] = &[
     "as", "asc", "assert", "assume", "bind", "desc", "else", "emit", "emits", "enum", "fn", "for",
     "goto", "if", "impl", "import", "in", "ir", "label", "left", "let", "mut", "op", "out",
-    "return", "right", "struct", "unsafe", "var",
+    "return", "right", "struct", "unreachable", "unsafe", "var",
 ];
 
 pub fn is_reserved(name: &str) -> bool {

@@ -239,6 +239,7 @@ Stmt: Stmt = {
     <bind_stmt:BindStmt> ";"+ => bind_stmt.into(),
     <emit_stmt:EmitStmt> ";"+ => emit_stmt,
     <ret_stmt:RetStmt> ";"+ => ret_stmt.into(),
+    "unreachable" ";"+ => Stmt::Unreachable,
     <expr:Expr<NoBlock>> ";"+ => expr.into(),
     <expr:BlockExpr> ";"+ => expr.into(),
 };

@@ -508,6 +508,8 @@ pub enum Stmt {
     Emit(Call),
     #[from]
     Ret(RetStmt),
+    #[display(fmt = "unreachable;")]
+    Unreachable,
     #[display(fmt = "{_0};")]
     #[from]
     Expr(Expr),

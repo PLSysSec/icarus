@@ -1,0 +1,45 @@
+// `unreachable` claims control never gets there. It satisfies a value-returning
+// function's return type without a value, and lowers to a proof obligation that
+// Corral has to discharge -- so a reachable one would fail this test, not pass it.
+
+fn classify(n: Int32) -> Int32 {
+    if n > 0_i32 {
+        return 1_i32;
+    } else if n < 0_i32 {
+        return -1_i32;
+    } else if n == 0_i32 {
+        return 0_i32;
+    }
+
+    // Exhaustive over the Int32s, so the obligation holds.
+    unreachable;
+}
+
+// Unit-typed, where a `return;` would also have done.
+fn ignore(b: Bool) {
+    if b {
+        return;
+    }
+
+    if !b {
+        return;
+    }
+
+    unreachable;
+}
+
+// Divergence propagates out of a nested block, and the statements after it are
+// dead rather than rejected.
+fn nested(n: Int32) -> Int32 {
+    if n == n {
+        return n;
+    } else {
+        unreachable;
+        return 0_i32;
+    }
+}
+
+fn test() -> Int32 {
+    ignore(true);
+    classify(7_i32) + classify(-7_i32) + classify(0_i32) + nested(3_i32)
+}

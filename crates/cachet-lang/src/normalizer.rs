@@ -362,6 +362,7 @@ impl<'a, 'b> ScopedNormalizer<'a, 'b> {
             type_checker::Stmt::Emit(emit_stmt) => self.normalize_emit_stmt(emit_stmt),
             type_checker::Stmt::Expr(expr) => self.normalize_unused_expr(expr),
             type_checker::Stmt::Ret(ret_stmt) => self.normalize_ret_stmt(ret_stmt),
+            type_checker::Stmt::Unreachable => self.stmts.push(Stmt::Unreachable),
         }
     }
 

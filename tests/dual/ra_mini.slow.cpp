@@ -3,6 +3,7 @@
 #include <iostream>
 
 #define Cachet_Assert assert
+#define Cachet_Unreachable() abort()
 
 #include <cpp_prelude.h>
 

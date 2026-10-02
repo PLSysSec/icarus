@@ -258,7 +258,7 @@ impl<'a> FlowTracer<'a> {
         assert_eq!(
             self.trace_stmts(&body.stmts),
             Break(()),
-            "tracing a body block should always terminate at a return statement"
+            "tracing a body block should always terminate at a return or an `unreachable`"
         );
         assert!(
             self.curr_state.is_empty(),
@@ -351,6 +351,14 @@ impl<'a> FlowTracer<'a> {
 
                 // Short-circuit flow-tracing of this callable: since we hit an
                 // return statement, nothing else along this path will run.
+                return Break(());
+            }
+            flattener::Stmt::Unreachable => {
+                // Control flow never gets past an `unreachable`, so treat it as
+                // a return. Any emits on-deck here become predecessors of the
+                // exit node, along an edge taken only if the unreachability
+                // obligation fails.
+                self.exit_state.append(&mut self.curr_state);
                 return Break(());
             }
             flattener::Stmt::If(if_stmt) => self.trace_if_stmt(if_stmt)?,

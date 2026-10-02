@@ -542,6 +542,7 @@ pub enum Stmt {
     Emit(Call),
     #[from]
     Ret(RetStmt),
+    Unreachable,
     #[from]
     Expr(Expr),
 }

@@ -322,6 +322,10 @@ impl FnIdent {
 pub enum HelperFnIdent {
     #[display(fmt = "Cachet_Assert")]
     Assert,
+    /// Must be declared `[[noreturn]]` by the embedder: it stands in for the
+    /// return a value-returning function would otherwise need.
+    #[display(fmt = "Cachet_Unreachable")]
+    Unreachable,
 }
 
 #[derive(Clone, Copy, Debug, Display, From)]

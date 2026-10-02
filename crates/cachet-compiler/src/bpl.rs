@@ -1525,7 +1525,24 @@ impl<'a, 'b> ScopedCompiler<'a, 'b> {
             flattener::Stmt::Invoke(invoke_stmt) => self.compile_invoke_stmt(invoke_stmt),
             flattener::Stmt::Assign(assign_stmt) => self.compile_assign_stmt(assign_stmt),
             flattener::Stmt::Ret(ret_stmt) => self.compile_ret_stmt(ret_stmt),
+            flattener::Stmt::Unreachable => self.compile_unreachable_stmt(),
         }
+    }
+
+    /// `unreachable` is a claim to be discharged, so it lowers to the obligation
+    /// plus a return. The return carries no value: a value-returning
+    /// procedure's `ret` is left unconstrained, which is sound because the only
+    /// path reaching it is the one the assertion rules out.
+    fn compile_unreachable_stmt(&mut self) {
+        self.stmts.extend([
+            CheckStmt {
+                kind: CheckKind::Assert,
+                attr: None,
+                cond: false.into(),
+            }
+            .into(),
+            Stmt::Ret,
+        ]);
     }
 
     fn compile_let_stmt(&mut self, let_stmt: &flattener::LetStmt) {

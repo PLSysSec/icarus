@@ -14,8 +14,8 @@ use typed_index_collections::TiVec;
 
 use crate::FrontendError;
 use crate::ast::{
-    ArithBinOper, BinOper, BlockKind, CastSafety, CheckKind, CompareBinOper, Ident, MaybeSpanned,
-    NegateKind, Path, Span, Spanned, VarParamKind,
+    ArithBinOper, BinOper, BlockKind, CastSafety, CompareBinOper, Ident, MaybeSpanned, NegateKind,
+    Path, Span, Spanned, VarParamKind,
 };
 use crate::built_in::{BuiltInType, BuiltInVar, IdentEnum, Signedness, Width};
 use crate::resolver;
@@ -1207,6 +1207,7 @@ impl<'a, 'b> ScopedTypeChecker<'a, 'b> {
             resolver::Stmt::Bind(bind_stmt) => Some(self.type_check_bind_stmt(bind_stmt).into()),
             resolver::Stmt::Emit(call) => self.type_check_emit_stmt(call).map(Into::into),
             resolver::Stmt::Ret(ret_stmt) => Some(self.type_check_ret_stmt(ret_stmt).into()),
+            resolver::Stmt::Unreachable => Some(Stmt::Unreachable),
             resolver::Stmt::Expr(expr) => Some(self.type_check_expr(expr).into()),
             resolver::Stmt::Block(kinded_block) => {
                 Some(self.type_check_block_stmt(kinded_block).into())
@@ -1836,25 +1837,12 @@ fn does_stmt_exit_early(stmt: &Stmt) -> bool {
         Stmt::Let(LetStmt { rhs: expr, .. }) | Stmt::Expr(expr) => does_expr_exit_early(expr),
         Stmt::If(if_stmt) => does_if_stmt_exit_early(if_stmt),
         Stmt::ForIn(for_in_stmt) => for_in_stmt.body.exits_early,
-        Stmt::Ret(_) => true,
-        Stmt::Check(check_stmt) => does_check_stmt_exit_early(check_stmt),
-        Stmt::Label(_) | Stmt::Goto(_) | Stmt::Bind(_) | Stmt::Emit(_) => false,
+        // `unreachable` claims control never gets past it, so a block ending in
+        // one never reaches its value, and the callable's return type is
+        // satisfied by its returns alone.
+        Stmt::Ret(_) | Stmt::Unreachable => true,
+        Stmt::Label(_) | Stmt::Check(_) | Stmt::Goto(_) | Stmt::Bind(_) | Stmt::Emit(_) => false,
     }
-}
-
-// Treat `assert false` as an early exit
-fn does_check_stmt_exit_early(check_stmt: &CheckStmt) -> bool {
-    check_stmt.kind == CheckKind::Assert && is_false(&check_stmt.cond)
-}
-
-fn is_false(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Var(VarExpr {
-            var: VarIndex::BuiltIn(BuiltInVar::False),
-            ..
-        })
-    )
 }
 
 fn does_if_stmt_exit_early(if_stmt: &IfStmt) -> bool {

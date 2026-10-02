@@ -100,7 +100,7 @@
     "keywords": {
       "patterns": [
         {
-          "match": "\\b(if|else|for|in|goto|return|emit)\\b",
+          "match": "\\b(if|else|for|in|goto|return|unreachable|emit)\\b",
           "name": "keyword.control.cachet"
         },
         {

@@ -1,0 +1,16 @@
+// A reachable `unreachable` must be caught: the statement is a claim, not an
+// escape hatch. `classify` leaves out the negative case, so `test` reaches it.
+
+fn classify(n: Int32) -> Int32 {
+    if n > 0_i32 {
+        return 1_i32;
+    } else if n == 0_i32 {
+        return 0_i32;
+    }
+
+    unreachable;
+}
+
+fn test() -> Int32 {
+    classify(-7_i32)
+}

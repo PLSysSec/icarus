@@ -343,6 +343,7 @@ pub enum Stmt {
     Emit(EmitStmt),
     #[from]
     Ret(RetStmt),
+    Unreachable,
     #[from]
     Expr(Expr),
 }
@@ -359,6 +360,7 @@ impl Typed for Stmt {
             Self::Bind(bind_stmt) => bind_stmt.type_(),
             Self::Emit(emit_stmt) => emit_stmt.type_(),
             Self::Ret(ret_stmt) => ret_stmt.type_(),
+            Self::Unreachable => BuiltInType::Unit.into(),
             // The final value of an expression statement is ignored, so the
             // statement itself is inherently unit-typed.
             Self::Expr(_) => BuiltInType::Unit.into(),
