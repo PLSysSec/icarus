@@ -30,7 +30,13 @@ impl fmt::Display for Span {
             Span::Unknown => write!(f, "<unknown>"),
             Span::Known { file, start, .. } => {
                 let name = file.file_name().unwrap_or(file.as_os_str());
-                write!(f, "{}:{}:{}", name.to_string_lossy(), start.line, start.column)
+                write!(
+                    f,
+                    "{}:{}:{}",
+                    name.to_string_lossy(),
+                    start.line,
+                    start.column
+                )
             }
         }
     }
@@ -83,6 +89,12 @@ pub enum Stmt {
     /// Kept rather than dropped as macro noise: this is what becomes `assume`.
     Assert(AssertStmt),
     Switch(SwitchStmt),
+    /// A freestanding `{ .. }`, which Cachet has too.
+    ///
+    /// Kept rather than flattened into its parent because the brace is where a
+    /// destructor runs: `{ ScratchTagScope tag(masm, input); .. }` releases the
+    /// tag register at the closing brace and nowhere else.
+    Block(CompoundStmt),
     /// `MOZ_CRASH("reason")`: this point is not reached.
     Crash(CrashStmt),
     /// An expression in statement position. libclang emits no wrapper node for
@@ -376,6 +388,7 @@ pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
                 v.visit_block(default);
             }
         }
+        Stmt::Block(b) => v.visit_block(b),
         // No subexpressions: the message is a string literal, not modeled.
         Stmt::Crash(_) => {}
         Stmt::Expr(e) => v.visit_expr(&e.value),
@@ -403,7 +416,10 @@ pub fn walk_expr<V: Visit + ?Sized>(v: &mut V, expr: &Expr) {
 
 pub fn walk_call<V: Visit + ?Sized>(v: &mut V, call: &Call) {
     // The receiver is an expression like any other: `v.isNumber()` reads `v`.
-    if let Callee::Method { recv: Some(recv), .. } = &call.callee {
+    if let Callee::Method {
+        recv: Some(recv), ..
+    } = &call.callee
+    {
         v.visit_expr(&recv.value);
     }
     for arg in &call.args {
@@ -829,10 +845,10 @@ fn extract_stmt_values(e: Entity) -> Result<Vec<Stmt>> {
             Ok(vec![Stmt::Return(ReturnStmt { value })])
         }
         EntityKind::SwitchStmt => Ok(vec![Stmt::Switch(extract_switch(e)?)]),
+        EntityKind::CompoundStmt => Ok(vec![Stmt::Block(extract_compound_stmt(e)?)]),
         // Loops and jumps are outside the subset. Naming them as statements is
         // clearer than letting them fall to the expression path.
-        EntityKind::CompoundStmt
-        | EntityKind::ForStmt
+        EntityKind::ForStmt
         | EntityKind::WhileStmt
         | EntityKind::DoStmt
         | EntityKind::BreakStmt
@@ -1032,7 +1048,9 @@ fn crash_reason(e: Entity) -> Option<String> {
     let mut found = None;
     e.visit_children(|child, _| {
         if child.get_kind() == EntityKind::StringLiteral {
-            found = child.get_display_name().map(|s| s.trim_matches('"').to_owned());
+            found = child
+                .get_display_name()
+                .map(|s| s.trim_matches('"').to_owned());
             return clang::EntityVisitResult::Break;
         }
         clang::EntityVisitResult::Recurse
@@ -1844,6 +1862,11 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
                 fmt_block(f, default, depth + 2)?;
             }
             Ok(())
+        }
+        Stmt::Block(b) => {
+            indent(f, depth)?;
+            writeln!(f, "Block")?;
+            fmt_block(f, b, depth + 1)
         }
         Stmt::Crash(s) => {
             indent(f, depth)?;

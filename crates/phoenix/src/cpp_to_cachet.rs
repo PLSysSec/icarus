@@ -194,6 +194,11 @@ pub fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         // Same name, same role: the bytecode op a generator is attaching for.
         (["JSOp"], []) => Ok(CachetPath::from_ident("JSOp")),
 
+        // The type tag a boxed value carries (Value.h:158, notes/js.cachet:349).
+        // Both are plain enums at the top level; only the variant spellings differ,
+        // which [`translate_enum_const`] already maps.
+        (["JSValueType"], []) => Ok(CachetPath::from_ident("JSValueType")),
+
         // The operand id family (notes/cacheir.cachet:89-263). Each names a slot
         // and the static type that slot carries; the C++ and Cachet spellings
         // differ only by convention. `CacheIR::defineInputValueId` returns
@@ -253,6 +258,23 @@ pub fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         // (RegisterSets.h:132 -- `code_ >= Registers::Total`). `AnyReg` in the model
         // (notes/masm.cachet:130).
         (["js", "jit", "AnyRegister"], []) => Ok(CachetPath::from_ident("AnyReg")),
+
+        // A general-purpose register. The model enumerates the sixteen x86-64 ones
+        // (notes/masm.cachet:6), where C++ carries an encoding, so the two agree on
+        // what the type denotes and not on how it is represented.
+        //
+        // The RAII wrappers denote one too, each by its `operator Register()` --
+        // CacheIRCompiler.h:560, :1085 and MacroAssembler-arm64.h:2187. A wrapper
+        // contributes no value of its own -- which is what that operator says, and
+        // how the C++ uses it; what it contributes is a *lifetime*, carried by
+        // [`scopes::Obligation`] rather than by a type.
+        //
+        // `ScratchTagScopeRelease` is deliberately absent: it holds a pointer to a
+        // scope rather than a register, and denotes nothing.
+        (["js", "jit", "Register"], [])
+        | (["js", "jit", "AutoScratchRegister"], [])
+        | (["js", "jit", "AutoScratchRegisterMaybeOutput"], [])
+        | (["js", "jit", "ScratchTagScope"], []) => Ok(CachetPath::from_ident("Reg")),
 
         _ => Err(Unhandled::new(format!(
             "type `{}` (canonically `{}`)",
@@ -723,6 +745,15 @@ fn translate_method(recv: &CppType, method: &str) -> Option<(&'static str, &'sta
         // tag check: `MOZ_ASSERT(!isFloat())` in C++ (RegisterSets.h:137), the same
         // assertion in `AnyReg::toReg`.
         (_, Some("AnyReg"), "gpr") => Some(("AnyReg", "toReg")),
+        // The float half, guarded the other way round: `MOZ_ASSERT(isFloat())`
+        // (RegisterSets.h:140) against the same assertion in `AnyReg::toFloatReg`.
+        // `TypedOrValueRegister` has an `fpu()` too (RegisterSets.h:1348), which
+        // keying on the Cachet type keeps separate from this one.
+        (_, Some("AnyReg"), "fpu") => Some(("AnyReg", "toFloatReg")),
+        // The tag those projections check, uninterpreted on both sides: C++ reads it
+        // off the register's encoding (`code_ >= Registers::Total`), the model leaves
+        // `AnyReg::isFloat` without a body (notes/masm.cachet:133).
+        (_, Some("AnyReg"), "isFloat") => Some(("AnyReg", "isFloat")),
 
         // Keyed on the C++ type, there being no Cachet type: an instruction
         // reaches registers *through* `allocator`, which the model holds no
@@ -926,6 +957,61 @@ fn is_output_register_decl(l: &CppLetStmt) -> bool {
     )
 }
 
+/// `AutoScratchRegister scratch(allocator, masm);` and the `MaybeOutput` flavour --
+/// a declaration that takes a register out of the allocator.
+///
+/// Both become `CacheIR::allocateReg()`. `MaybeOutput` reuses the output register
+/// when one is free rather than allocating, which the model's allocator does not
+/// express; translating it as an allocation is still sound, because the output
+/// register is assumed *un*allocated (notes/utils.cachet:64) and so
+/// `allocateReg` may return it. The cost is register pressure, not correctness:
+/// the model consumes one where the C++ reuses.
+///
+/// Only the two-argument form, which is what makes the defaulted argument worth
+/// dropping in `cpp_subset`. The three-argument form asks for a *fixed* register,
+/// and the model's counterpart for that is `unsafe fn allocateKnownReg`, so it is
+/// left to be refused.
+fn is_scratch_register_decl(l: &CppLetStmt) -> bool {
+    const SCRATCH: [&str; 3] = ["js", "jit", "AutoScratchRegister"];
+    const SCRATCH_MAYBE_OUTPUT: [&str; 3] = ["js", "jit", "AutoScratchRegisterMaybeOutput"];
+
+    matches!(
+        l.init.as_ref().map(|init| &init.value),
+        Some(CppExpr::Construct(c))
+            if (c.ty.scope == SCRATCH && c.args.len() == 2)
+                || (c.ty.scope == SCRATCH_MAYBE_OUTPUT && c.args.len() == 3)
+    )
+}
+
+/// `ScratchTagScope tag(masm, input);` -- a declaration that takes the register the
+/// Value's type tag will be extracted into.
+///
+/// A scope type because where the tag lives is platform-dependent: on 64-bit a Value
+/// is one register, so its tag needs another one allocated, while on 32-bit a Value
+/// is already a (type, payload) pair and the tag is `value.typeReg()`. The model
+/// takes the 64-bit reading and fixes the register at R11
+/// (notes/cacheir.cachet:1848), which is why `allocateScratchReg` takes no argument.
+fn is_tag_scope_decl(l: &CppLetStmt) -> bool {
+    matches!(
+        l.init.as_ref().map(|init| &init.value),
+        Some(CppExpr::Construct(c)) if c.ty.scope == ["js", "jit", "ScratchTagScope"]
+    )
+}
+
+/// `ScratchTagScopeRelease _(&tag);` -- a declaration that *gives the tag register
+/// back* for the length of its block, and takes it again at the end.
+///
+/// The inverse of the wrapper above, and the one RAII type here whose constructor
+/// gives up a resource rather than taking one: its body is `ts_->release()`, its
+/// destructor `ts_->reacquire()` (MacroAssembler-arm64.h:2211). Emitters use it to
+/// free a register up once the tag has been read for the last time.
+fn is_tag_scope_release_decl(l: &CppLetStmt) -> bool {
+    matches!(
+        l.init.as_ref().map(|init| &init.value),
+        Some(CppExpr::Construct(c)) if c.ty.scope == ["js", "jit", "ScratchTagScopeRelease"]
+    )
+}
+
 /// `emitLoadStubField(..)` on the compiler's implicit `this`.
 fn is_load_stub_field(call: &CppCall) -> bool {
     matches!(
@@ -1009,14 +1095,75 @@ fn int_literal(ty: Option<&CppType>, n: i64) -> Result<Expr, Unhandled> {
 /// same reason: the tables map a call to a call and a name to a name, so an
 /// idiom that crosses those categories has nowhere to live. One helper per
 /// pattern.
-fn translate_known_expr(ctx: &Ctx<'_>, expr: &CppTypedExpr) -> Option<Expr> {
+fn translate_known_expr(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    expr: &CppTypedExpr,
+) -> Result<Option<Expr>, Unhandled> {
     if let Some(label) = translate_failure_label(ctx, expr) {
-        return Some(label);
+        return Ok(Some(label));
     }
     if let Some(label) = translate_label_ref(ctx, expr) {
-        return Some(label);
+        return Ok(Some(label));
     }
-    None
+    if let Some(ty) = translate_output_type(ctx, state, expr)? {
+        return Ok(Some(ty));
+    }
+    Ok(None)
+}
+
+/// `output.type()` is two calls in the model.
+///
+/// C++ folds the conversion into the method: `AutoOutputRegister::type()` is
+/// `ValueTypeFromMIRType(output_.type())` (CacheIRCompiler.h:1012), while the model
+/// keeps the register's `MIRType` and the conversion to a `JSValueType`
+/// (notes/js.cachet:393) apart. A table keyed on the receiver yields one callee, so
+/// the composition lives here.
+///
+/// Keyed on the *C++* type, not the Cachet one: `TypedOrValueRegister::type()`
+/// returns the `MIRType` unconverted, so the two spell one method name and mean
+/// different things, and both receivers translate to `TypedOrValueReg`.
+///
+/// Drops the method's `MOZ_ASSERT(!hasValue())` along with the fold -- sound, but
+/// weaker than descending into the method would be. See docs/next-steps.md.
+fn translate_output_type(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    expr: &CppTypedExpr,
+) -> Result<Option<Expr>, Unhandled> {
+    let CppExpr::Call(call) = &expr.value else {
+        return Ok(None);
+    };
+    let CppCallee::Method {
+        recv: Some(recv),
+        callee,
+    } = &call.callee
+    else {
+        return Ok(None);
+    };
+    if callee.name != "type" || !call.args.is_empty() {
+        return Ok(None);
+    }
+    if !recv
+        .ty
+        .as_ref()
+        .is_some_and(|ty| ty.scope == AUTO_OUTPUT_REGISTER)
+    {
+        return Ok(None);
+    }
+
+    let call = |target: &str, name: &str, arg: Expr| {
+        Expr::Invoke(Call {
+            target: Spanned::internal(CachetPath::from_ident(target).nest(Ident::from(name))),
+            args: Spanned::internal(vec![Spanned::internal(to_arg(arg))]),
+        })
+    };
+    let reg = translate_expr(ctx, state, recv)?;
+    Ok(Some(call(
+        "JSValueType",
+        "fromMIRType",
+        call("TypedOrValueReg", "type", reg),
+    )))
 }
 
 /// `&ifTrue` is the label `ifTrue`.
@@ -1192,7 +1339,7 @@ fn translate_expr_value(
     state: &mut State,
     expr: &CppTypedExpr,
 ) -> Result<Expr, Unhandled> {
-    if let Some(known) = translate_known_expr(ctx, expr) {
+    if let Some(known) = translate_known_expr(ctx, state, expr)? {
         return Ok(known);
     }
     match &expr.value {
@@ -1543,6 +1690,12 @@ fn translate_stmt_values(
                 None => Vec::new(),
             })
         }
+        // A freestanding block, which Cachet has too. `translate_block` pushes a
+        // scope, so what the block's declarations owe is discharged at its closing
+        // brace rather than the enclosing one.
+        CppStmt::Block(body) => Ok(vec![Spanned::internal(Stmt::from(translate_block(
+            ctx, state, body,
+        )?))]),
         // `MOZ_CRASH("..")` says control never reaches here, which is exactly
         // `unreachable`. The reason string has no counterpart, so it is kept as a
         // comment.
@@ -1670,6 +1823,61 @@ fn translate_known_stmt(
                 },
                 rhs: Spanned::internal(rhs),
             }))]
+        }
+
+        // `AutoScratchRegister scratch2(allocator, masm);` takes a register out of
+        // the allocator, and its destructor puts it back. The model spells the first
+        // half `CacheIR::allocateReg()`; the second has no C++ line of its own, so it
+        // becomes an obligation on the enclosing block.
+        //
+        // The wrapper itself is not represented: it denotes the register
+        // (`operator Register()`), which is why `translate_type` sends it to `Reg`
+        // and why references to `scratch2` need nothing special.
+        CppStmt::Let(l) if is_scratch_register_decl(l) => {
+            let reg = ctx.names.ident(&l.name);
+            state.scopes.acquire_reg(reg);
+            vec![Spanned::internal(Stmt::Let(LetStmt {
+                lhs: LocalVar {
+                    ident: Spanned::internal(reg),
+                    is_mut: false,
+                    type_: None,
+                },
+                rhs: Spanned::internal(invoke(
+                    CachetPath::from_ident("CacheIR").nest(Ident::from("allocateReg")),
+                )),
+            }))]
+        }
+
+        // `ScratchTagScope tag(masm, input);` takes the tag register, and its
+        // destructor gives it back. Shaped like the scratch declaration above, with
+        // a different pair of model calls, and refusing a nested one: the model has
+        // only the one tag register to give.
+        CppStmt::Let(l) if is_tag_scope_decl(l) => {
+            if !state.scopes.acquire_tag_scope() {
+                return Err(Unhandled::new(String::from(
+                    "a second `ScratchTagScope`: the model has one tag register, R11",
+                )));
+            }
+            vec![Spanned::internal(Stmt::Let(LetStmt {
+                lhs: LocalVar {
+                    ident: Spanned::internal(ctx.names.ident(&l.name)),
+                    is_mut: false,
+                    type_: None,
+                },
+                rhs: Spanned::internal(invoke(
+                    CachetPath::from_ident("CacheIR").nest(Ident::from("allocateScratchReg")),
+                )),
+            }))]
+        }
+
+        // `ScratchTagScopeRelease _(&tag);` gives the tag register back for the
+        // length of its block. Binds nothing: the declared variable is never named
+        // again, the construction itself being the effect.
+        CppStmt::Let(l) if is_tag_scope_release_decl(l) => {
+            state.scopes.lend_tag_scope();
+            vec![Spanned::internal(Stmt::Expr(invoke(
+                CachetPath::from_ident("CacheIR").nest(Ident::from("releaseScratchReg")),
+            )))]
         }
 
         // `writer.compareDoubleResult(..)` records a CacheIR op, which Cachet
@@ -2102,6 +2310,24 @@ fn discharge(obligations: Vec<Obligation>) -> Vec<Spanned<Stmt>> {
             Obligation::ReleaseFailurePath => Spanned::internal(Stmt::Expr(invoke(
                 CachetPath::from_ident("CacheIR").nest(Ident::from("releaseFailurePath")),
             ))),
+            Obligation::ReleaseScratchReg => Spanned::internal(Stmt::Expr(invoke(
+                CachetPath::from_ident("CacheIR").nest(Ident::from("releaseScratchReg")),
+            ))),
+            // Takes the tag register back. The register it returns is discarded, an
+            // expression statement being unit-typed whatever its expression's type
+            // (type_checker/ast.rs) -- which is how the model writes it too
+            // (notes/cacheir.cachet:1424).
+            Obligation::ReacquireScratchReg => Spanned::internal(Stmt::Expr(invoke(
+                CachetPath::from_ident("CacheIR").nest(Ident::from("allocateScratchReg")),
+            ))),
+            Obligation::ReleaseReg(reg) => Spanned::internal(Stmt::Expr(Expr::Invoke(Call {
+                target: Spanned::internal(
+                    CachetPath::from_ident("CacheIR").nest(Ident::from("releaseReg")),
+                ),
+                args: Spanned::internal(vec![Spanned::internal(to_arg(Expr::Var(
+                    Spanned::internal(CachetPath::from_ident(reg)),
+                )))]),
+            }))),
         })
         .collect()
 }

@@ -56,11 +56,19 @@ Things settled along the way, worth not re-deriving:
 ## Smaller things, roughly by value
 
 - **4 elided `MOZ_ASSERT`s** remain in the output. Dropping an assertion is sound but
-  weakens the proof. One of them cannot be translated faithfully as-is:
-  `MOZ_ASSERT(output.type() == JSVAL_TYPE_BOOLEAN)` in `EmitStoreBoolean`, because
-  `AutoOutputRegister::type()` is `ValueTypeFromMIRType(output_.type())` and nothing
-  models that conversion. The hand-written model compares a raw `MIRType` instead,
-  which is likely *stale* rather than clever — remember the C++ is ground truth.
+  weakens the proof. None of them is now known to be untranslatable: this entry used
+  to claim `MOZ_ASSERT(output.type() == JSVAL_TYPE_BOOLEAN)` in `EmitStoreBoolean` was,
+  on the grounds that nothing modelled `ValueTypeFromMIRType`. Something does —
+  `JSValueType::fromMIRType` (notes/js.cachet:393), checked case for case against
+  IonTypes.h:563 — and `output.type()` translates as of 2026-10-02.
+- **`JSValueType::fromMIRType` is modelled where it could be translated.**
+  `ValueTypeFromMIRType` is a `static inline` in the TU and its `switch` is within the
+  subset, so phoenix could descend into it instead of trusting the model. Worth doing:
+  the model's version ends `assert type == MIRType::Object; JSValueType::Object` where
+  the C++ ends `default: MOZ_CRASH("bad type")` — the default-arm fold, by hand — so a
+  translation would now be *more* faithful than what it is being mapped to. Same goes
+  for `AutoOutputRegister::type()` itself, whose `MOZ_ASSERT(!hasValue())`
+  `translate_output_type` drops.
 - **`left_` / `right_` are renamed for nothing.** `left` and `right` are in
   `names::RESERVED`, but measurement showed `cachet-compiler` accepts them in both
   parameter and `let` position; the other 27 names are refused in both. Only those two
@@ -94,10 +102,21 @@ Things settled along the way, worth not re-deriving:
 
 ## Bigger pieces, already discussed
 
-- **`releaseReg` for the `Auto*` scratch registers.** `scopes::Obligation` exists and
-  carries failure paths; scratch registers are the other half and are not done. See
-  `scope-end-effects.md`. Note these differ from failure paths: C++ *does*
-  release them, from a destructor, so they are relocated rather than invented.
+- **The tag register is modelled as 64-bit only.** `ScratchTagScope` exists because the
+  tag of a `Value` lives somewhere different per platform: on 64-bit a Value is one
+  register, so extracting its tag needs *another* register to be allocated; on 32-bit a
+  Value is already a (type, payload) register pair, so the tag is `value.typeReg()` and
+  nothing is allocated. The model takes the 64-bit story and goes further, fixing the
+  tag register at R11: `CacheIR::allocateScratchReg()` returns `Reg::scratchReg()`
+  (notes/cacheir.cachet:1848), which is why `releaseScratchReg()` needs no argument.
+  Worth returning to if 32-bit is ever in scope, and worth knowing meanwhile that
+  `ScratchTagScopeRelease` — which lends the tag register out for an inner block and
+  takes it back — is a *no-op* on 32-bit, so a translation that drops it is right there
+  and wrong here.
+- **`ScratchTagScope` and `ScratchTagScopeRelease` are not translated.** The two scratch
+  wrappers are (see below); these are the rest of `emitCompareNullUndefinedResult`.
+  `ScratchTagScopeRelease` is the awkward one: it releases on *construction* and
+  re-acquires on destruction, so its scope-end obligation is the inverse of the others'.
 - **Splitting the model** into a file holding only the modeled `fn`s and `var`s, no
   CacheIR ops. Kyle wants this "soon". Not blocking: `ir CacheIROps` coexists with the
   model's `ir CacheIR`, and the model's own ops simply go unused. Two facts settled by
@@ -109,7 +128,7 @@ Things settled along the way, worth not re-deriving:
 
 ## The other notes here
 
-All three are current as of this writing: `masm-op-overloads.md` (the operand column
-landed, the `_` rows remain), `scope-end-effects.md` (failure paths done, `Auto*`
-register releases not), and `nonlocal-transformations.md` (the cases are implemented;
-it records why there is no second IR).
+`masm-op-overloads.md` (the operand column landed, the `_` rows remain) and
+`nonlocal-transformations.md` (the cases are implemented; it records why there is no
+second IR) are current. `scope-end-effects.md` was rewritten 2026-10-02 when the
+register half landed.

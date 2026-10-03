@@ -97,7 +97,7 @@ pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<MasmStmt<
         return Some(vec![MasmStmt::Bind { label }]);
     }
 
-    // Two methods need more than a name-and-shape lookup, for different reasons, so
+    // Three methods need more than a name-and-shape lookup, for different reasons, so
     // they sit here rather than in the table.
     let (op, args) = match callee.name.as_str() {
         // Its op depends on what a register *holds*, which is nowhere in the call:
@@ -105,6 +105,14 @@ pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<MasmStmt<
         "move32" => (move32_op(&call.args, scopes)?, call.args.iter().collect()),
         // Its op absorbs the immediate, so choosing it also rewrites an argument.
         "movePtr" => move_ptr(&call.args)?,
+        // Its message is dropped: the model's op takes none, and the string carries
+        // no semantics -- the body is `assert false` with or without it. The model
+        // records wanting it anyway (notes/masm.cachet:794).
+        //
+        // This is not the `unreachable` statement. `MOZ_CRASH` is the generator
+        // giving up as it runs, while this *emits* an instruction that traps when
+        // the generated code runs, so it stays an emit.
+        "assumeUnreachable" => ("AssumeUnreachable", Vec::new()),
         method => (translate_op(method, &call.args)?, call.args.iter().collect()),
     };
 
@@ -209,6 +217,29 @@ fn translate_op(method: &str, args: &[CppTypedExpr]) -> Option<&'static str> {
         ("jump", _) => "Jump",
         ("moveValue", Some("Value")) => "MoveValueImm",
         ("moveValue", Some("ValueReg")) => "MoveValue",
+        // Boxes `payload` as a `valTy` into `dest` (notes/masm.cachet:964). Not a
+        // provisional `_`: every one of the nine platform headers declares the
+        // single signature `tagValue(JSValueType, Register, ValueOperand)`.
+        ("tagValue", _) => "TagValue",
+        // Sets `dest` from whether the value's tag matches, under `condition`
+        // (notes/masm.cachet:1468, :1529). Also settled rather than provisional:
+        // nine platform headers, one signature each,
+        // `(Condition, const ValueOperand&, Register)`.
+        ("testNullSet", _) => "TestNullSet",
+        ("testUndefinedSet", _) => "TestUndefinedSet",
+        // A whole-register copy: the model's `Move` reads and writes the register's
+        // data untyped (notes/masm.cachet:812), where the `Move32*` ops read a typed
+        // 32-bit payload, so this needs none of `move32`'s guessing at contents.
+        // Keyed because only one of arm64's five `mov` overloads is modelled -- the
+        // rest take `ImmWord`, `ImmPtr`, `SymbolicAddress` or `CodeLabel*`
+        // (MacroAssembler-arm64.h:739-743).
+        ("mov", Some("Reg")) => "Move",
+        // Keyed rather than `_`: the source is overloaded three ways on arm64 --
+        // `Register`, `Address`, `BaseIndex` (MacroAssembler-arm64.h:457-468), and
+        // four on x86 -- while the model has only the register form
+        // (notes/masm.cachet:1285). The memory forms want an address in the model
+        // before they can be translated, so they fall through and are refused.
+        ("convertInt32ToDouble", Some("Reg")) => "ConvertInt32ToDouble",
         _ => return None,
     })
 }

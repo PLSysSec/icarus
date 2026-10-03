@@ -6,34 +6,45 @@
 
 use std::collections::HashMap;
 
-use cachet_lang::ast::Path as CachetPath;
+use cachet_lang::ast::{Ident, Path as CachetPath};
 
-/// Whether a failure path is outstanding at a point in the walk, and what the
-/// current block therefore owes.
+/// Something the translator must emit on leaving a point in the walk.
 ///
-/// The model requires `addFailurePath` and `releaseFailurePath` to balance --
-/// each asserts the other's state (notes/cacheir.cachet:1806-1820) -- while C++
-/// needs no release at all, `addedFailurePath_` being cleared by `nextOp()`
-/// between instructions. So every release is inserted, with no C++ line behind it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Held {
-    #[default]
-    No,
-    /// Responsibility: release on return.
-    Inherited,
-    /// Responsibility: release on return & scope end.
-    Owned,
-}
-
-/// Something the translator must emit on leaving a point in the walk, with no C++
-/// line behind it.
-///
-/// A list rather than a single value because the kinds will multiply: an
-/// `AutoScratchRegister` going out of scope owes a `releaseReg` in just the same
-/// way, differing only in that C++ does emit that one, from a destructor.
+/// Held by the block that took it on, which is what says who discharges it: a
+/// `return` leaves every enclosing block and so owes all of them, while falling
+/// out of a block owes only its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Obligation {
+    /// `CacheIR::releaseFailurePath()`, which has no C++ line behind it at all.
+    ///
+    /// The model requires `addFailurePath` and `releaseFailurePath` to balance --
+    /// each asserts the other's state (notes/cacheir.cachet:1806-1820) -- while C++
+    /// needs no release, `addedFailurePath_` being cleared by `nextOp()` between
+    /// instructions. So every release is inserted.
     ReleaseFailurePath,
+    /// `CacheIR::releaseReg(_)` for a scratch register whose `Auto*` wrapper is
+    /// going out of scope.
+    ///
+    /// Unlike a failure path, C++ *does* emit this one, from the wrapper's
+    /// destructor, so it is relocated rather than invented. Which is why it carries
+    /// a name: the destructor knows which register it holds, and the statement it
+    /// becomes has to say so.
+    ReleaseReg(Ident),
+    /// `CacheIR::releaseScratchReg()`: give the tag register back, owed by a
+    /// `ScratchTagScope`.
+    ///
+    /// Carries no name, unlike [`Obligation::ReleaseReg`]: the model fixes the tag
+    /// register at R11 rather than binding one (notes/cacheir.cachet:1848).
+    ReleaseScratchReg,
+    /// `CacheIR::allocateScratchReg()`: take the tag register *back*, owed by a
+    /// `ScratchTagScopeRelease`.
+    ///
+    /// That wrapper lends the tag register out for the length of a block, by
+    /// releasing it in its constructor and calling `reacquire()` in its destructor
+    /// (MacroAssembler-arm64.h:2211). So its obligation is the inverse of the one
+    /// above, and it is the only obligation whose C++ counterpart *takes* a
+    /// resource rather than giving one up.
+    ReacquireScratchReg,
 }
 
 /// The locals declared in one C++ block.
@@ -46,7 +57,9 @@ pub struct Scope {
     /// value, so `masm.move32(a, b)` is `Move32Bool` or `Move32Int32` depending on
     /// a fact the C++ never states.
     registers: HashMap<String, CachetPath>,
-    failure_path: Held,
+    /// What the block owes on the way out, in the order it took them on.
+    /// Discharged in reverse, C++ destroying in reverse of construction.
+    owed: Vec<Obligation>,
 }
 
 /// The blocks enclosing the statement being translated, innermost last.
@@ -57,48 +70,79 @@ pub struct Scope {
 pub struct Scopes(Vec<Scope>);
 
 impl Scopes {
-    /// A block inherits an outstanding failure path from the one enclosing it, so
-    /// a `return` anywhere inside releases it.
     pub fn push(&mut self) {
-        let failure_path = match self.failure_path() {
-            Held::No => Held::No,
-            Held::Inherited | Held::Owned => Held::Inherited,
-        };
-        self.0.push(Scope {
-            failure_path,
-            ..Scope::default()
-        });
+        self.0.push(Scope::default());
     }
 
     pub fn pop(&mut self) {
         self.0.pop();
     }
 
-    fn failure_path(&self) -> Held {
-        self.0.last().map_or(Held::No, |scope| scope.failure_path)
-    }
-
-    fn set_failure_path(&mut self, held: Held) {
+    /// Records that the innermost block has taken an obligation on. Dropped when
+    /// there is no block, which cannot happen while translating one.
+    fn owe(&mut self, obligation: Obligation) {
         if let Some(scope) = self.0.last_mut() {
-            scope.failure_path = held;
+            scope.owed.push(obligation);
         }
     }
 
     /// Records that this block took out a failure path.
     ///
-    /// `false` when one is already outstanding, which the model forbids and C++
-    /// asserts against -- "multiple failure paths for instruction". The caller
-    /// reports it, since it is a fault in the C++ rather than a gap in the
+    /// `false` when one is already outstanding *anywhere* enclosing, which the model
+    /// forbids and C++ asserts against -- "multiple failure paths for instruction".
+    /// The caller reports it, since it is a fault in the C++ rather than a gap in the
     /// translation.
     pub fn acquire_failure_path(&mut self) -> bool {
-        if self.failure_path() != Held::No {
+        if self
+            .0
+            .iter()
+            .any(|scope| scope.owed.contains(&Obligation::ReleaseFailurePath))
+        {
             return false;
         }
-        self.set_failure_path(Held::Owned);
+        self.owe(Obligation::ReleaseFailurePath);
         true
     }
 
+    /// Records that this block holds a scratch register, to be released when it
+    /// goes out of scope.
+    pub fn acquire_reg(&mut self, reg: Ident) {
+        self.owe(Obligation::ReleaseReg(reg));
+    }
+
+    /// Records that this block holds the tag register.
+    ///
+    /// `false` when one is already outstanding. Unlike a second failure path, this
+    /// is a limit of the model rather than a fault in the C++: nesting is fine on
+    /// 64-bit, where vixl hands out a second and different register, while the model
+    /// fixes the tag register at R11, so the second `allocateScratchReg` would trip
+    /// `allocateKnownReg`'s "register should not already be allocated"
+    /// (notes/support.bpl:434). None of the 5 declarations in CacheIRCompiler.cpp
+    /// nests, so this is defensive.
+    pub fn acquire_tag_scope(&mut self) -> bool {
+        if self
+            .0
+            .iter()
+            .any(|scope| scope.owed.contains(&Obligation::ReleaseScratchReg))
+        {
+            return false;
+        }
+        self.owe(Obligation::ReleaseScratchReg);
+        true
+    }
+
+    /// Records that this block has lent the tag register out and takes it back at
+    /// its end.
+    pub fn lend_tag_scope(&mut self) {
+        self.owe(Obligation::ReacquireScratchReg);
+    }
+
+
     /// Discharges what a `return` here owes, and says what discharges it.
+    ///
+    /// A `return` leaves every enclosing block, so it owes all of them -- innermost
+    /// first, and within each in reverse of the order taken on, which is the order
+    /// C++ runs the destructors in.
     ///
     /// One call rather than a query and a separate update: the obligation is gone
     /// once it has been reported, so there is no state in which a caller can see it
@@ -107,23 +151,28 @@ impl Scopes {
     /// Only this block is marked discharged. An enclosing block's fall-through path
     /// still owes its own, being a different path.
     pub fn on_return(&mut self) -> Vec<Obligation> {
-        if self.failure_path() == Held::No {
-            return Vec::new();
+        let obligations = self
+            .0
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.owed.iter().rev().copied())
+            .collect();
+        if let Some(scope) = self.0.last_mut() {
+            scope.owed.clear();
         }
-        self.set_failure_path(Held::No);
-        vec![Obligation::ReleaseFailurePath]
+        obligations
     }
 
-    /// Discharges what falling out of this block owes.
+    /// Discharges what falling out of this block owes: its own obligations only.
     ///
-    /// Only the block that acquired the failure path owes one; an inheriting block
-    /// would be releasing while the acquirer is still using it.
+    /// An enclosing block's are not discharged here -- a failure path taken out
+    /// further up is still in use afterwards, and a register further up is still
+    /// held.
     pub fn on_scope_end(&mut self) -> Vec<Obligation> {
-        if self.failure_path() != Held::Owned {
-            return Vec::new();
+        match self.0.last_mut() {
+            Some(scope) => scope.owed.drain(..).rev().collect(),
+            None => Vec::new(),
         }
-        self.set_failure_path(Held::No);
-        vec![Obligation::ReleaseFailurePath]
     }
 
     /// Records a register-valued local in the innermost block. Dropped when there
