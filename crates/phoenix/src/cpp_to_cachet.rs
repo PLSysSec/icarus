@@ -7,12 +7,9 @@ use cachet_lang::ast::{
 };
 use cachet_lang::ast::{CheckKind, NegateKind};
 use cachet_lang::parser::{
-    FieldAccess,
     BinOperExpr, BindStmt, Block, Call, CallableItem, CheckStmt, Comment, ElseClause, Expr,
-    GlobalVarItem,
-    IfStmt as CachetIfStmt, ImportItem, IrItem, Item, Label as CachetLabel, LabelStmt, LetStmt,
-    Literal, LocalVar, Mod, NegateExpr,
-    RetStmt, Stmt,
+    FieldAccess, GlobalVarItem, IfStmt as CachetIfStmt, ImportItem, IrItem, Item,
+    Label as CachetLabel, LabelStmt, LetStmt, Literal, LocalVar, Mod, NegateExpr, RetStmt, Stmt,
 };
 use clang::{Entity, EntityKind};
 
@@ -21,16 +18,16 @@ use crate::cacheir_ops::{
     id_user, is_operand_id, is_stub_field, op_path, translate_arg_type, writer_arity,
     writer_method,
 };
-use crate::cpp_subset::{
-    Call as CppCall, Callee as CppCallee, Callees, CompoundStmt as CppCompoundStmt,
-    Construct as CppConstruct, Expr as CppExpr, FnDef, IfStmt as CppIfStmt, Indirection,
-    LetStmt as CppLetStmt, Lit as CppLit,
-    Error as SubsetError, FnId, FnRef, Param, RefKind, Span as CppSpan, Spanned as CppSpanned, TypedExpr as CppTypedExpr,
-    Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
-};
-use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
 use crate::cachet_utils::{emitted_ops, to_arg};
 use crate::clang_utils::find_definition;
+use crate::cpp_subset::{
+    Call as CppCall, Callee as CppCallee, Callees, CompoundStmt as CppCompoundStmt,
+    Construct as CppConstruct, Error as SubsetError, Expr as CppExpr, FnDef, FnId, FnRef,
+    IfStmt as CppIfStmt, Indirection, LetStmt as CppLetStmt, Lit as CppLit, Param, RefKind,
+    Span as CppSpan, Spanned as CppSpanned, Stmt as CppStmt, Type as CppType,
+    TypedExpr as CppTypedExpr, get_fn_def, walk_block,
+};
+use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
 use crate::masm_ops::{LABEL, MACRO_ASSEMBLER, MASM, MasmStmt, is_masm, masm_call};
 use crate::names::{NameMap, declared_names};
 use crate::scopes::{Obligation, Scopes};
@@ -228,16 +225,15 @@ pub fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         (["unsigned char"], []) => Ok(CachetPath::from_ident("UInt8")),
         (["unsigned short"], []) => Ok(CachetPath::from_ident("UInt16")),
         (["unsigned int"], []) => Ok(CachetPath::from_ident("UInt32")),
-        (["unsigned long"] | ["unsigned long long"], []) => {
-            Ok(CachetPath::from_ident("UInt64"))
-        }
+        (["unsigned long"] | ["unsigned long long"], []) => Ok(CachetPath::from_ident("UInt64")),
 
         // A register holding either a boxed value or an unboxed one of a known type
         // (notes/masm.cachet:172). `AutoOutputRegister` denotes one too: the RAII
         // part has nothing to do in a model with no allocator state, and
         // `operator TypedOrValueRegister()` is what a helper taking one receives --
         // which is how `CacheIR::emitStoreBool` takes it.
-        (["js", "jit", "TypedOrValueRegister"], []) | (["js", "jit", "AutoOutputRegister"], []) => {
+        (["js", "jit", "TypedOrValueRegister"], [])
+        | (["js", "jit", "AutoOutputRegister"], []) => {
             Ok(CachetPath::from_ident("TypedOrValueReg"))
         }
 
@@ -796,9 +792,7 @@ fn translate_enum_const<'n>(ty: &str, name: &'n str) -> Option<(&'static str, &'
         ("JSValueType", "JSVAL_TYPE_MAGIC") => Some(("JSValueType", "Magic")),
         ("JSValueType", "JSVAL_TYPE_STRING") => Some(("JSValueType", "String")),
         ("JSValueType", "JSVAL_TYPE_SYMBOL") => Some(("JSValueType", "Symbol")),
-        ("JSValueType", "JSVAL_TYPE_PRIVATE_GCTHING") => {
-            Some(("JSValueType", "PrivateGCThing"))
-        }
+        ("JSValueType", "JSVAL_TYPE_PRIVATE_GCTHING") => Some(("JSValueType", "PrivateGCThing")),
         ("JSValueType", "JSVAL_TYPE_BIGINT") => Some(("JSValueType", "BigInt")),
         ("JSValueType", "JSVAL_TYPE_OBJECT") => Some(("JSValueType", "Object")),
         ("JSValueType", "JSVAL_TYPE_UNKNOWN") => Some(("JSValueType", "Unknown")),
@@ -1238,8 +1232,9 @@ fn translate_allocator_register(
     };
 
     let id_ty = translate_type(expr_type(id)?)?;
-    let target = family(&id_ty)
-        .ok_or_else(|| Unhandled::new(format!("no `{}` of a `{id_ty}` in the model", callee.name)))?;
+    let target = family(&id_ty).ok_or_else(|| {
+        Unhandled::new(format!("no `{}` of a `{id_ty}` in the model", callee.name))
+    })?;
     let call = Expr::Invoke(Call {
         target: Spanned::internal(
             CachetPath::from_ident("CacheIR").nest(Ident::from(target.to_owned())),
@@ -1351,9 +1346,11 @@ fn translate_expr_value(
         // register -- `EmitStoreBoolean(masm, b, const AutoOutputRegister& output)`
         // -- and that parameter survives into the signature, so the name carries
         // over like any other.
-        CppExpr::Ref(r) if r.kind == RefKind::Local && r.ty.scope == AUTO_OUTPUT_REGISTER => Ok(Expr::Var(
-            Spanned::internal(CachetPath::from_ident("CacheIR").nest(Ident::from("outputReg"))),
-        )),
+        CppExpr::Ref(r) if r.kind == RefKind::Local && r.ty.scope == AUTO_OUTPUT_REGISTER => {
+            Ok(Expr::Var(Spanned::internal(
+                CachetPath::from_ident("CacheIR").nest(Ident::from("outputReg")),
+            )))
+        }
         CppExpr::Ref(r) => match r.kind {
             // An instruction's offset parameter, which stands for a field the
             // model already has typed. The model has no notion of an offset, so
@@ -1380,12 +1377,9 @@ fn translate_expr_value(
             // parameter often carries the very same name the C++ gave the local
             // -- `val` in `LoadInt32Constant` -- so the reference would
             // silently resolve to the field itself and type check.
-            RefKind::Local if state.stub_fields.contains_key(&r.name) => {
-                Err(Unhandled::new(format!(
-                    "stub field offset `{}`: the model has no offsets",
-                    r.name
-                )))
-            }
+            RefKind::Local if state.stub_fields.contains_key(&r.name) => Err(Unhandled::new(
+                format!("stub field offset `{}`: the model has no offsets", r.name),
+            )),
             // A parameter the generated signature binds under another name, the
             // two being written independently: the yaml says `result` where the
             // definition says `resultId`.
@@ -1464,11 +1458,7 @@ fn translate_expr_value(
             let args = call
                 .args
                 .iter()
-                .map(|arg| {
-                    Ok(Spanned::internal(to_arg(translate_expr(
-                        ctx, state, arg,
-                    )?)))
-                })
+                .map(|arg| Ok(Spanned::internal(to_arg(translate_expr(ctx, state, arg)?))))
                 .collect::<Result<Vec<_>, Unhandled>>()?;
             Ok(Expr::Invoke(Call {
                 target: Spanned::internal(target),
@@ -1483,10 +1473,7 @@ fn translate_expr_value(
             } => {
                 let recv_ty = expr_type(recv)?;
                 let (ty, name) = translate_method(recv_ty, &callee.name).ok_or_else(|| {
-                    Unhandled::new(format!(
-                        "method `{}` on `{}`",
-                        callee.name, recv_ty.spelled
-                    ))
+                    Unhandled::new(format!("method `{}` on `{}`", callee.name, recv_ty.spelled))
                 })?;
                 let target = CachetPath::from_ident(ty).nest(Ident::from(name));
 
@@ -1495,16 +1482,12 @@ fn translate_expr_value(
                 // one is no value at all, so there is nothing to pass.
                 let mut args = Vec::new();
                 if translate_type(recv_ty).is_ok() {
-                    args.push(Spanned::internal(to_arg(translate_expr(
-                        ctx, state, recv,
-                    )?)));
+                    args.push(Spanned::internal(to_arg(translate_expr(ctx, state, recv)?)));
                 }
                 // An ambient entity is no value in the model, so where C++ hands
                 // one along -- `useValueRegister(masm, inputId)` -- it is dropped.
                 for arg in call.args.iter().filter(|arg| !is_ambient_expr(arg)) {
-                    args.push(Spanned::internal(to_arg(translate_expr(
-                        ctx, state, arg,
-                    )?)));
+                    args.push(Spanned::internal(to_arg(translate_expr(ctx, state, arg)?)));
                 }
                 Ok(Expr::Invoke(Call {
                     target: Spanned::internal(target),
@@ -1528,11 +1511,7 @@ fn translate_expr_value(
                     .iter()
                     // An ambient entity isn't a value, so it isn't passed.
                     .filter(|arg| !is_ambient_expr(arg))
-                    .map(|arg| {
-                        Ok(Spanned::internal(to_arg(translate_expr(
-                            ctx, state, arg,
-                        )?)))
-                    })
+                    .map(|arg| Ok(Spanned::internal(to_arg(translate_expr(ctx, state, arg)?))))
                     .collect::<Result<Vec<_>, Unhandled>>()?;
                 Ok(Expr::Invoke(Call {
                     target: Spanned::internal(target),
@@ -1576,9 +1555,9 @@ fn translate_expr_value(
         CppExpr::Lit(CppLit::Double(d)) => Ok(Expr::Literal(Literal::Double(*d))),
         // `true` and `false` are built-in variables, not literals
         // (built_in.rs:206).
-        CppExpr::Lit(CppLit::Bool(b)) => Ok(Expr::Var(Spanned::internal(
-            CachetPath::from_ident(if *b { "true" } else { "false" }),
-        ))),
+        CppExpr::Lit(CppLit::Bool(b)) => Ok(Expr::Var(Spanned::internal(CachetPath::from_ident(
+            if *b { "true" } else { "false" },
+        )))),
         // Cachet's literals are numeric, and it models no string type.
         CppExpr::Lit(CppLit::Str(s)) => Err(Unhandled::new(format!("string literal {s:?}"))),
         CppExpr::This => Err(Unhandled::new(String::from("`this`"))),
@@ -1649,7 +1628,9 @@ fn translate_stmt_values(
             })));
             Ok(stmts)
         }
-        CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(translate_if(ctx, state, s)?))]),
+        CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(translate_if(
+            ctx, state, s,
+        )?))]),
         // Cachet has no switch, so each case becomes a rung of an `else if` chain
         // testing the scrutinee against every value sharing that case's body, and
         // `default:` becomes the final `else`.
@@ -1713,7 +1694,10 @@ fn translate_stmt_values(
         // initializer -- `Label done;` -- has no counterpart.
         CppStmt::Let(l) => {
             let init = l.init.as_ref().ok_or_else(|| {
-                Unhandled::new(format!("declaration of `{}` without an initializer", l.name))
+                Unhandled::new(format!(
+                    "declaration of `{}` without an initializer",
+                    l.name
+                ))
             })?;
             Ok(vec![Spanned::internal(Stmt::Let(LetStmt {
                 lhs: LocalVar {
@@ -1886,7 +1870,10 @@ fn translate_known_stmt(
         //
         // The op's *semantics* live in `CacheIRCompiler::emit<Op>`, which is a
         // separate unit to translate; the call is not chased into it.
-        CppStmt::Expr(CppTypedExpr { value: CppExpr::Call(call), .. }) if writer_call(ctx, call).is_some() => {
+        CppStmt::Expr(CppTypedExpr {
+            value: CppExpr::Call(call),
+            ..
+        }) if writer_call(ctx, call).is_some() => {
             let method = writer_call(ctx, call).unwrap().name.as_str();
             let op = resolve_op(ctx.ops, method)?;
             check_arity(op, method, call.args.len())?;
@@ -1905,11 +1892,7 @@ fn translate_known_stmt(
             let args = call
                 .args
                 .iter()
-                .map(|arg| {
-                    Ok(Spanned::internal(to_arg(translate_expr(
-                        ctx, state, arg,
-                    )?)))
-                })
+                .map(|arg| Ok(Spanned::internal(to_arg(translate_expr(ctx, state, arg)?))))
                 .collect::<Result<Vec<_>, Unhandled>>()?;
             vec![Spanned::internal(Stmt::Emit(Call {
                 target: Spanned::internal(op_path(op, ctx.op_ir)),
@@ -1919,7 +1902,10 @@ fn translate_known_stmt(
         // `emitLoadStubField(val, reg)` reads the field into a register. The C++
         // is generic and switches on the kind; the model has one function per
         // kind, Cachet having no overloading, so the kind recorded above picks it.
-        CppStmt::Expr(CppTypedExpr { value: CppExpr::Call(call), .. }) if is_load_stub_field(call) => {
+        CppStmt::Expr(CppTypedExpr {
+            value: CppExpr::Call(call),
+            ..
+        }) if is_load_stub_field(call) => {
             let [field, dst] = call.args.as_slice() else {
                 return Err(Unhandled::new(format!(
                     "`emitLoadStubField` takes 2 arguments, called with {}",
@@ -1937,9 +1923,9 @@ fn translate_known_stmt(
                     r.name
                 ))
             })?;
-            let ty = ctx.cachet_param_ty(&field).ok_or_else(|| {
-                Unhandled::new(format!("`{field}` is not an operand of the op"))
-            })?;
+            let ty = ctx
+                .cachet_param_ty(&field)
+                .ok_or_else(|| Unhandled::new(format!("`{field}` is not an operand of the op")))?;
             let loader = field_loader(ty)
                 .ok_or_else(|| Unhandled::new(format!("no loader for a `{ty}` in the model")))?;
 
@@ -1956,7 +1942,10 @@ fn translate_known_stmt(
             })))]
         }
 
-        CppStmt::Expr(CppTypedExpr { value: CppExpr::Call(call), .. }) if dropped_call(ctx, call).is_some() => {
+        CppStmt::Expr(CppTypedExpr {
+            value: CppExpr::Call(call),
+            ..
+        }) if dropped_call(ctx, call).is_some() => {
             // Recorded even though nothing is emitted, so the tally of what the
             // module leaves out stays complete.
             state.gaps.push(Gap {
@@ -1969,7 +1958,10 @@ fn translate_known_stmt(
         // `masm.branchTestNull(..)` emits machine code, which Cachet spells
         // `emit MASM::BranchTestNull(..)`. The receiver is ambient, so only the
         // arguments carry over.
-        CppStmt::Expr(CppTypedExpr { value: CppExpr::Call(_), .. }) if masm_call(&stmt.value, &state.scopes).is_some() => {
+        CppStmt::Expr(CppTypedExpr {
+            value: CppExpr::Call(_),
+            ..
+        }) if masm_call(&stmt.value, &state.scopes).is_some() => {
             // One call can mean several statements, so this is a loop: see
             // `masm_call`.
             let masm_stmts = masm_call(&stmt.value, &state.scopes).unwrap();
@@ -1980,9 +1972,7 @@ fn translate_known_stmt(
                         let args = args
                             .iter()
                             .map(|arg| {
-                                Ok(Spanned::internal(to_arg(translate_expr(
-                                    ctx, state, arg,
-                                )?)))
+                                Ok(Spanned::internal(to_arg(translate_expr(ctx, state, arg)?)))
                             })
                             .collect::<Result<Vec<_>, Unhandled>>()?;
                         Stmt::Emit(Call {
@@ -2070,9 +2060,9 @@ fn translate_if(
         None => None,
         Some(els) => match els.stmts.as_slice() {
             [only] => match &only.value {
-                CppStmt::If(inner) => {
-                    Some(ElseClause::ElseIf(Box::new(translate_if(ctx, state, inner)?)))
-                }
+                CppStmt::If(inner) => Some(ElseClause::ElseIf(Box::new(translate_if(
+                    ctx, state, inner,
+                )?))),
                 _ => Some(ElseClause::Else(translate_block(ctx, state, els)?)),
             },
             _ => Some(ElseClause::Else(translate_block(ctx, state, els)?)),
@@ -2566,23 +2556,17 @@ impl Translation {
     }
 
     pub fn failures(&self) -> impl Iterator<Item = &Gap> {
-        self.gaps
-            .iter()
-            .filter(|g| g.fidelity == Fidelity::Failed)
+        self.gaps.iter().filter(|g| g.fidelity == Fidelity::Failed)
     }
 
     /// Reported apart from [`Translation::failures`]: the same verdict, a different
     /// place to go looking.
     pub fn invalid(&self) -> impl Iterator<Item = &Gap> {
-        self.gaps
-            .iter()
-            .filter(|g| g.fidelity == Fidelity::Invalid)
+        self.gaps.iter().filter(|g| g.fidelity == Fidelity::Invalid)
     }
 
     pub fn elisions(&self) -> impl Iterator<Item = &Gap> {
-        self.gaps
-            .iter()
-            .filter(|g| g.fidelity == Fidelity::Elided)
+        self.gaps.iter().filter(|g| g.fidelity == Fidelity::Elided)
     }
 
     /// One line, for a caller reporting the outcome.
@@ -2806,8 +2790,7 @@ fn translate_transitive_callees<'tu>(
                 match create_op_wrapper(op, op_ir) {
                     Ok(item) => helpers.push(Spanned::internal(Item::Fn(item))),
                     Err(e) => {
-                        let what =
-                            format!("no wrapper for `{}`: {}", writer_method(op), e.what);
+                        let what = format!("no wrapper for `{}`: {}", writer_method(op), e.what);
                         helpers.push(note(what.clone()));
                         gaps.push(Gap {
                             fidelity: e.fidelity,
@@ -2930,9 +2913,9 @@ pub fn translate_cacheir_op(
             ))
         })?
         .to_owned();
-    let op = ops.get(&name).ok_or_else(|| {
-        Unhandled::new(format!("no op `{name}` in CacheIROps.yaml"))
-    })?;
+    let op = ops
+        .get(&name)
+        .ok_or_else(|| Unhandled::new(format!("no op `{name}` in CacheIROps.yaml")))?;
 
     // The declaration in `CacheIROpsGenerated.h` is generated from the yaml args
     // in order, and the definition implements that declaration, so the two lists
@@ -3088,13 +3071,8 @@ pub fn translate_generator(
     // defined once.
     let mut seen = HashSet::from([gen_def.def.name.id.clone()]);
     // Each definition brings its own callees, so deeper helpers stay resolvable.
-    let (gen_helpers, mut gaps) = translate_transitive_callees(
-        &ops,
-        op_ir,
-        gen_def.def.callees,
-        state,
-        &mut seen,
-    );
+    let (gen_helpers, mut gaps) =
+        translate_transitive_callees(&ops, op_ir, gen_def.def.callees, state, &mut seen);
 
     // After the generator's pass, not before: the ops reached through a wrapper are
     // only visible once `translate_transitive_callees` has synthesized it, and

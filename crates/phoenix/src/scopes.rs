@@ -137,7 +137,6 @@ impl Scopes {
         self.owe(Obligation::ReacquireScratchReg);
     }
 
-
     /// Discharges what a `return` here owes, and says what discharges it.
     ///
     /// A `return` leaves every enclosing block, so it owes all of them -- innermost

@@ -16,8 +16,8 @@ use cachet_lang::parser::{
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::cpp_to_cachet::Unhandled;
 use crate::cachet_utils::to_arg;
+use crate::cpp_to_cachet::Unhandled;
 use crate::names::is_reserved;
 
 /// The name of an op argument's type, e.g. `ValId`, `RawInt32Field`, `JSOpImm`.
@@ -683,7 +683,10 @@ mod tests {
             op_path(guard_is_null, OpIr::Model).to_string(),
             "CacheIR::GuardIsNull"
         );
-        assert_eq!(render(&op_sig(guard_is_null).unwrap().params), "input: ValueId");
+        assert_eq!(
+            render(&op_sig(guard_is_null).unwrap().params),
+            "input: ValueId"
+        );
         assert_eq!(writer_method(guard_is_null), "guardIsNull");
         assert!(helper_sig(guard_is_null).unwrap().is_none());
 
@@ -812,9 +815,7 @@ mod tests {
         assert_eq!(ops.len(), 468);
         assert_eq!(ops.iter().filter(|o| o.custom_writer).count(), 26);
         assert_eq!(
-            ops.iter()
-                .filter(|o| o.args.contains_key("result"))
-                .count(),
+            ops.iter().filter(|o| o.args.contains_key("result")).count(),
             69
         );
         assert_eq!(ops.iter().filter(|o| o.args.is_empty()).count(), 8);

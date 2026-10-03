@@ -495,7 +495,10 @@ fn report_gaps(symbol: &str, gaps: &[phoenix::cpp_to_cachet::Gap]) {
         eprintln!("{symbol}: complete, {elided} elided");
         return;
     }
-    eprintln!("{symbol}: PARTIAL, {} failed, {elided} elided", failed.len());
+    eprintln!(
+        "{symbol}: PARTIAL, {} failed, {elided} elided",
+        failed.len()
+    );
     for gap in failed {
         eprintln!("  failed: {gap}");
     }
@@ -504,8 +507,9 @@ fn report_gaps(symbol: &str, gaps: &[phoenix::cpp_to_cachet::Gap]) {
 
 fn write_out(out: Option<&Path>, text: &str) {
     match out {
-        Some(path) => std::fs::write(path, text)
-            .unwrap_or_else(|e| panic!("write {}: {e}", path.display())),
+        Some(path) => {
+            std::fs::write(path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()))
+        }
         None => print!("{text}"),
     }
 }

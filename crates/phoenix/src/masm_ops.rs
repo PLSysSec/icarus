@@ -113,7 +113,10 @@ pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<MasmStmt<
         // giving up as it runs, while this *emits* an instruction that traps when
         // the generated code runs, so it stays an emit.
         "assumeUnreachable" => ("AssumeUnreachable", Vec::new()),
-        method => (translate_op(method, &call.args)?, call.args.iter().collect()),
+        method => (
+            translate_op(method, &call.args)?,
+            call.args.iter().collect(),
+        ),
     };
 
     let mut stmts = vec![MasmStmt::Emit { op, args }];
@@ -190,56 +193,79 @@ fn reg_kind<'s>(arg: &CppTypedExpr, scopes: &'s Scopes) -> Option<&'s CachetPath
 /// A `MacroAssembler` method to the op modeling it in `notes/masm.cachet`.
 ///
 /// Keyed on the method name and, where the model splits a method into several ops,
-/// the shape of its first operand -- which is what C++ overloads on. `moveValue` is
-/// the first to need it: `MoveValue` takes a register source, `MoveValueImm` a
-/// `Value`, and the call says which.
+/// the shapes of its first two operands -- which is what C++ overloads on.
+/// `moveValue` was the first to need a shape at all: `MoveValue` takes a register
+/// source, `MoveValueImm` a `Value`, and the call says which. Two positions rather
+/// than one because the `branchTest*` family overloads on its *second*: the first is
+/// always the `Condition`.
 ///
-/// A `_` in the shape column does not mean the method has one overload, only that
-/// the model has one op for the overloads reached so far. `branchTestNull` is four
-/// C++ overloads against two model ops -- `BranchTestNull` for a `ValueOperand`,
-/// `BranchTestNullTag` for a tag `Register` -- and every emitter so far passes the
-/// former. Those rows want filling in as they are reached rather than guessed at.
+/// A `_` in a shape column does not mean the method has one overload, only that the
+/// model has one op for the overloads reached so far. Those rows want filling in as
+/// they are reached rather than guessed at. Where the model has nothing for an
+/// overload -- the `Address` and `BaseIndex` forms, which want an address in the
+/// model -- no row matches and the call is refused.
 ///
 /// Only 45 of the model's 106 ops are even the lowercased method name, so this stays
 /// a table either way.
 fn translate_op(method: &str, args: &[CppTypedExpr]) -> Option<&'static str> {
-    Some(match (method, operand_shape(args.first()).as_deref()) {
-        ("branchTestNull", _) => "BranchTestNull",
-        ("branchTestInt32", _) => "BranchTestInt32",
+    let shape = |i: usize| operand_shape(args.get(i));
+    Some(match (method, shape(0).as_deref(), shape(1).as_deref()) {
+        ("branchTestInt32", _, _) => "BranchTestInt32",
+        // The tag forms take an already-extracted tag register, where the plain ones
+        // take a whole `Value` and extract it themselves -- so they ask the same
+        // question of different things and are separate ops. Four C++ overloads
+        // apiece (MacroAssembler.h:1960-2055); the `Address` and `BaseIndex` two are
+        // refused.
+        ("branchTestNull", _, Some("ValueReg")) => "BranchTestNull",
+        ("branchTestNull", _, Some("Reg")) => "BranchTestNullTag",
+        ("branchTestUndefined", _, Some("ValueReg")) => "BranchTestUndefined",
+        ("branchTestUndefined", _, Some("Reg")) => "BranchTestUndefinedTag",
+        ("branchTestObject", _, Some("ValueReg")) => "BranchTestObject",
+        ("branchTestObject", _, Some("Reg")) => "BranchTestObjectTag",
+        // Extracts a `Value`'s type tag into a register (notes/masm.cachet:2161).
+        // One signature, `(const ValueOperand&, ScratchTagScope&)`.
+        ("splitTagForTest", _, _) => "SplitTagForTest",
+        // Keyed because the model has only the `ValueOperand` source
+        // (notes/masm.cachet:1022) of four overloads -- the others take a `Register`,
+        // an `Address` or a `BaseIndex` (MacroAssembler-arm64.h:1447-1457).
+        ("unboxObject", Some("ValueReg"), _) => "UnboxObject",
+        // One signature, `(Register, Register, Label*, Label*)`
+        // (MacroAssembler.h:1849), against notes/masm.cachet:1512.
+        ("branchIfObjectEmulatesUndefined", _, _) => "BranchIfObjectEmulatesUndefined",
         // `Branch32Tag`, `Branch32Imm` and `Branch32AddressImm32` are the model's
         // other three.
-        ("branch32", _) => "Branch32",
+        ("branch32", _, _) => "Branch32",
         // Templated on the source, `fallibleUnboxBoolean(const T&, Register,
         // Label*)`. The model has the `ValueOperand` instantiation only.
-        ("fallibleUnboxBoolean", _) => "FallibleUnboxBoolean",
+        ("fallibleUnboxBoolean", _, _) => "FallibleUnboxBoolean",
         // An unconditional branch to a label, which is an ordinary op: the label is
         // its argument, unlike `bind`'s.
-        ("jump", _) => "Jump",
-        ("moveValue", Some("Value")) => "MoveValueImm",
-        ("moveValue", Some("ValueReg")) => "MoveValue",
+        ("jump", _, _) => "Jump",
+        ("moveValue", Some("Value"), _) => "MoveValueImm",
+        ("moveValue", Some("ValueReg"), _) => "MoveValue",
         // Boxes `payload` as a `valTy` into `dest` (notes/masm.cachet:964). Not a
         // provisional `_`: every one of the nine platform headers declares the
         // single signature `tagValue(JSValueType, Register, ValueOperand)`.
-        ("tagValue", _) => "TagValue",
+        ("tagValue", _, _) => "TagValue",
         // Sets `dest` from whether the value's tag matches, under `condition`
         // (notes/masm.cachet:1468, :1529). Also settled rather than provisional:
         // nine platform headers, one signature each,
         // `(Condition, const ValueOperand&, Register)`.
-        ("testNullSet", _) => "TestNullSet",
-        ("testUndefinedSet", _) => "TestUndefinedSet",
+        ("testNullSet", _, _) => "TestNullSet",
+        ("testUndefinedSet", _, _) => "TestUndefinedSet",
         // A whole-register copy: the model's `Move` reads and writes the register's
         // data untyped (notes/masm.cachet:812), where the `Move32*` ops read a typed
         // 32-bit payload, so this needs none of `move32`'s guessing at contents.
         // Keyed because only one of arm64's five `mov` overloads is modelled -- the
         // rest take `ImmWord`, `ImmPtr`, `SymbolicAddress` or `CodeLabel*`
         // (MacroAssembler-arm64.h:739-743).
-        ("mov", Some("Reg")) => "Move",
+        ("mov", Some("Reg"), _) => "Move",
         // Keyed rather than `_`: the source is overloaded three ways on arm64 --
         // `Register`, `Address`, `BaseIndex` (MacroAssembler-arm64.h:457-468), and
         // four on x86 -- while the model has only the register form
         // (notes/masm.cachet:1285). The memory forms want an address in the model
         // before they can be translated, so they fall through and are refused.
-        ("convertInt32ToDouble", Some("Reg")) => "ConvertInt32ToDouble",
+        ("convertInt32ToDouble", Some("Reg"), _) => "ConvertInt32ToDouble",
         _ => return None,
     })
 }
@@ -251,9 +277,7 @@ fn translate_op(method: &str, args: &[CppTypedExpr]) -> Option<&'static str> {
 /// Object, ..)` -- so the C++'s `ImmWord` construction has nowhere to go and the
 /// value inside it is passed instead. The only masm mapping so far where choosing
 /// the op also rewrites an argument.
-fn move_ptr<'e>(
-    args: &'e [CppTypedExpr],
-) -> Option<(&'static str, Vec<&'e CppTypedExpr>)> {
+fn move_ptr<'e>(args: &'e [CppTypedExpr]) -> Option<(&'static str, Vec<&'e CppTypedExpr>)> {
     let [imm, dst] = args else {
         return None;
     };
