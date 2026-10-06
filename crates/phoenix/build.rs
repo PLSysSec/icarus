@@ -86,6 +86,7 @@ fn main() {
         log: PathBuf::from(env::var("OUT_DIR").unwrap()).join("setup.log"),
     };
     setup.clone_tree();
+    fs::write(&setup.mozconfig, MOZCONFIG).unwrap();
     setup.bootstrap();
     setup.configure();
     setup.export();
@@ -186,7 +187,6 @@ impl Setup {
         if self.objdir.join("config.status").exists() {
             return;
         }
-        fs::write(&self.mozconfig, MOZCONFIG).unwrap();
         self.warn("running `mach configure`");
         self.mach(&["configure"]);
     }
