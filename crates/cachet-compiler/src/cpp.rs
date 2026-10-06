@@ -229,7 +229,7 @@ impl ItemBuckets {
 
 impl IntoIterator for ItemBuckets {
     type Item = Item;
-    type IntoIter = impl Iterator<Item = Self::Item>;
+    type IntoIter = std::vec::IntoIter<Item>;
 
     fn into_iter(self) -> Self::IntoIter {
         let ItemBuckets {
@@ -253,6 +253,8 @@ impl IntoIterator for ItemBuckets {
             ..ir_item_buckets.into_iter().flatten(),
             ..top_level_items
         ]
+        .collect::<Vec<_>>()
+        .into_iter()
     }
 }
 
@@ -282,7 +284,7 @@ impl IrItemBuckets {
 
 impl IntoIterator for IrItemBuckets {
     type Item = Item;
-    type IntoIter = impl Iterator<Item = Self::Item>;
+    type IntoIter = std::vec::IntoIter<Item>;
 
     fn into_iter(self) -> Self::IntoIter {
         let IrItemBuckets {
@@ -332,6 +334,8 @@ impl IntoIterator for IrItemBuckets {
         };
 
         iterate![..if_def_items, ..misc_namespace_item]
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
@@ -1034,6 +1038,7 @@ impl<'a, 'b> ScopedCompiler<'a, 'b> {
             normalizer::Stmt::Invoke(invoke_stmt) => self.compile_invoke_stmt(invoke_stmt),
             normalizer::Stmt::Assign(assign_stmt) => self.compile_assign_stmt(assign_stmt),
             normalizer::Stmt::Ret(ret_stmt) => self.compile_ret_stmt(ret_stmt),
+            normalizer::Stmt::Unreachable => self.compile_unreachable_stmt(),
         }
     }
 
@@ -1212,6 +1217,21 @@ impl<'a, 'b> ScopedCompiler<'a, 'b> {
             }
             CheckKind::Assume => (),
         }
+    }
+
+    /// Lowers to `Cachet_Unreachable()`, which the embedder defines as a
+    /// `[[noreturn]]` crash (`MOZ_CRASH` in SpiderMonkey). It stands in for the
+    /// valueless return C++ cannot express in a value-returning function, and it
+    /// has to carry the check itself, since `Cachet_Assert` is `MOZ_ASSERT` and
+    /// compiles away in release builds.
+    fn compile_unreachable_stmt(&mut self) {
+        self.stmts.push(
+            Expr::from(CallExpr {
+                target: HelperFnIdent::Unreachable.into(),
+                args: Vec::new(),
+            })
+            .into(),
+        );
     }
 
     fn compile_goto_stmt(&mut self, goto_stmt: &normalizer::GotoStmt) {

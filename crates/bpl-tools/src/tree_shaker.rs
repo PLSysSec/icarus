@@ -1,7 +1,5 @@
 // vim: set tw=99 ts=4 sts=4 sw=4 et:
 
-#![feature(is_some_and)]
-
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -14,12 +12,12 @@ use codespan_reporting::files::SimpleFile;
 use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 use lazy_static::lazy_static;
-use structopt::clap::AppSettings;
 use structopt::StructOpt;
+use structopt::clap::AppSettings;
 
 use bpl::ast::Ident;
 
-use bpl_tools::{shake_tree, Namespace, NamespacedIdent, ParseError};
+use bpl_tools::{Namespace, NamespacedIdent, ParseError, shake_tree};
 
 /// A dead-code eliminator for the Boogie intermediate verification language.
 #[derive(StructOpt)]

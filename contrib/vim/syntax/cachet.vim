@@ -14,7 +14,7 @@ syn keyword cachetKeyword import var let out label bind return
 syn keyword cachetStorage mut
 syn keyword cachetConditional if else
 syn keyword cachetLoop for in asc desc
-syn keyword cachetControlFlow goto
+syn keyword cachetControlFlow goto unreachable
 syn keyword cachetEmit emit
 
 syn match cachetIdent "\%([^[:cntrl:][:space:][:punct:][:digit:]]\|_\)\%([^[:cntrl:][:punct:][:space:]]\|_\)*" display contained

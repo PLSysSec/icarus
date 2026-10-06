@@ -9,8 +9,8 @@ use phf::phf_map;
 
 use cachet_util::fmt_join_or;
 
-use crate::ast::{FileId, Span};
 use crate::FrontendError;
+use crate::ast::{FileId, Span};
 
 use crate::parser::helpers::RawParseError;
 

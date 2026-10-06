@@ -125,7 +125,7 @@ macro_rules! collection_wrapper_impls {
 
         impl<'a> IntoIterator for &'a $collection {
             type Item = &'a $item;
-            type IntoIter = impl Iterator<Item = Self::Item>;
+            type IntoIter = <&'a $wrapped as IntoIterator>::IntoIter;
 
             fn into_iter(self) -> Self::IntoIter {
                 (&self.$field).into_iter()
@@ -134,7 +134,7 @@ macro_rules! collection_wrapper_impls {
 
         impl<'a> IntoIterator for &'a mut $collection {
             type Item = &'a mut $item;
-            type IntoIter = impl Iterator<Item = Self::Item>;
+            type IntoIter = <&'a mut $wrapped as IntoIterator>::IntoIter;
 
             fn into_iter(self) -> Self::IntoIter {
                 (&mut self.$field).into_iter()
@@ -143,7 +143,7 @@ macro_rules! collection_wrapper_impls {
 
         impl IntoIterator for $collection {
             type Item = $item;
-            type IntoIter = impl Iterator<Item = Self::Item>;
+            type IntoIter = <$wrapped as IntoIterator>::IntoIter;
 
             fn into_iter(self) -> Self::IntoIter {
                 self.$field.into_iter()

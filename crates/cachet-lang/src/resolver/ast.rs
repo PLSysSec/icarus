@@ -523,14 +523,10 @@ impl From<Block> for KindedBlock {
 
 #[derive(Clone, Debug, From)]
 pub enum Stmt {
-    #[from(types(Block))]
-    Block(KindedBlock),
     #[from]
     Let(LetStmt),
     #[from]
     Label(LabelStmt),
-    #[from]
-    If(IfStmt),
     #[from]
     ForIn(ForInStmt),
     #[from]
@@ -542,8 +538,13 @@ pub enum Stmt {
     Emit(Call),
     #[from]
     Ret(RetStmt),
-    #[from]
+    Unreachable,
+    /// An expression in statement position with no trailing semicolon, which
+    /// requires it to be unit-typed.
     Expr(Expr),
+    /// An expression in statement position with a trailing semicolon, which
+    /// discards its value whatever the type.
+    Semi(Expr),
 }
 
 #[derive(Clone, Debug)]
@@ -570,7 +571,7 @@ impl Typed for LabelStmt {
 }
 
 #[derive(Clone, Debug)]
-pub struct IfStmt {
+pub struct IfExpr {
     pub cond: Spanned<Expr>,
     pub then: Block,
     pub else_: Option<ElseClause>,
@@ -579,7 +580,7 @@ pub struct IfStmt {
 #[derive(Clone, Debug, From)]
 pub enum ElseClause {
     #[from]
-    ElseIf(Box<IfStmt>),
+    ElseIf(Box<IfExpr>),
     #[from]
     Else(Block),
 }
@@ -648,6 +649,8 @@ pub enum Expr {
     #[from]
     Block(Box<KindedBlock>),
     #[from]
+    If(Box<IfExpr>),
+    #[from]
     Literal(Literal),
     #[from]
     Var(Spanned<VarIndex>),
@@ -665,6 +668,7 @@ pub enum Expr {
 }
 
 box_from!(KindedBlock => Expr);
+box_from!(IfExpr => Expr);
 box_from!(FieldAccess => Expr);
 box_from!(NegateExpr => Expr);
 box_from!(CastExpr => Expr);

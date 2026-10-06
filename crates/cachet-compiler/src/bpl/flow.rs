@@ -8,7 +8,7 @@ use derive_more::From;
 use typed_index_collections::{TiSlice, TiVec};
 
 use cachet_lang::flattener;
-use cachet_util::{typed_field_index, MaybeOwned};
+use cachet_util::{MaybeOwned, typed_field_index};
 
 use crate::bpl::ast::*;
 
@@ -213,10 +213,12 @@ impl<'a> FlowTracer<'a> {
         let exit_label_node_index = self.graph.exit_label_node_index();
         for param_index in param_order {
             if let flattener::ParamIndex::Label(label_param_index) = param_index
-                    && params[label_param_index].label.ir == self.bottom_ir_index {
+                && params[label_param_index].label.ir == self.bottom_ir_index
+            {
                 // Top-level input label parameters are all represented by the
                 // shared global exit label.
-                self.label_scope.insert(label_param_index.into(), exit_label_node_index);
+                self.label_scope
+                    .insert(label_param_index.into(), exit_label_node_index);
             }
         }
     }
@@ -230,7 +232,8 @@ impl<'a> FlowTracer<'a> {
     ) {
         for (param_index, arg) in param_order.iter().zip(args) {
             if let flattener::ParamIndex::Label(label_param_index) = param_index
-                    && params[label_param_index].label.ir == self.bottom_ir_index {
+                && params[label_param_index].label.ir == self.bottom_ir_index
+            {
                 let arg_label_node_index = match arg {
                     flattener::Arg::Expr(_) | flattener::Arg::OutVar(_) => continue,
                     flattener::Arg::Label(label_arg) => caller_label_scope[&label_arg.label],
@@ -238,7 +241,8 @@ impl<'a> FlowTracer<'a> {
                     // label.
                     flattener::Arg::LabelField(_) => self.graph.exit_label_node_index(),
                 };
-                self.label_scope.insert(label_param_index.into(), arg_label_node_index);
+                self.label_scope
+                    .insert(label_param_index.into(), arg_label_node_index);
             }
         }
     }
@@ -254,7 +258,7 @@ impl<'a> FlowTracer<'a> {
         assert_eq!(
             self.trace_stmts(&body.stmts),
             Break(()),
-            "tracing a body block should always terminate at a return statement"
+            "tracing a body block should always terminate at a return or an `unreachable`"
         );
         assert!(
             self.curr_state.is_empty(),
@@ -324,7 +328,9 @@ impl<'a> FlowTracer<'a> {
         match stmt {
             flattener::Stmt::Label(_)
             | flattener::Stmt::Let(flattener::LetStmt { rhs: None, .. }) => (),
-            flattener::Stmt::Let(flattener::LetStmt { rhs: Some(expr), .. })
+            flattener::Stmt::Let(flattener::LetStmt {
+                rhs: Some(expr), ..
+            })
             | flattener::Stmt::Assign(flattener::AssignStmt { rhs: expr, .. })
             | flattener::Stmt::Check(flattener::CheckStmt { cond: expr, .. }) => {
                 self.trace_expr(expr);
@@ -345,6 +351,14 @@ impl<'a> FlowTracer<'a> {
 
                 // Short-circuit flow-tracing of this callable: since we hit an
                 // return statement, nothing else along this path will run.
+                return Break(());
+            }
+            flattener::Stmt::Unreachable => {
+                // Control flow never gets past an `unreachable`, so treat it as
+                // a return. Any emits on-deck here become predecessors of the
+                // exit node, along an edge taken only if the unreachability
+                // obligation fails.
+                self.exit_state.append(&mut self.curr_state);
                 return Break(());
             }
             flattener::Stmt::If(if_stmt) => self.trace_if_stmt(if_stmt)?,

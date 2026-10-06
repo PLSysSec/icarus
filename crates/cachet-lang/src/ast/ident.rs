@@ -97,7 +97,10 @@ struct PathNode {
 
 impl Path {
     pub fn new<T: Into<Ident>>(parent: Option<Path>, ident: T) -> Self {
-        Path(Intern::new(PathNode { parent, ident: ident.into() }))
+        Path(Intern::new(PathNode {
+            parent,
+            ident: ident.into(),
+        }))
     }
 
     pub fn from_ident<T: Into<Ident>>(ident: T) -> Self {

@@ -6,7 +6,7 @@ license = "MPL-2.0"
 description = """
 Language and toolset for trustworthy JIT implementation
 """
-edition = "2021"
+edition = "2024"
 
 [build-dependencies]
 lalrpop = { git = "https://github.com/PLSysSec/lalrpop", branch = "cachet" }
@@ -21,7 +21,7 @@ enum-iterator = "0.8.1"
 enumset = "1.0.6"
 internment = "0.5.4"
 iterate = "1.0.0"
-lalrpop-util = { git = "https://github.com/PLSysSec/lalrpop", branch = "cachet" }
+lalrpop-util = { git = "https://github.com/PLSysSec/lalrpop", branch = "cachet", features = ["lexer"] }
 lazy_static = "1.4.0"
 petgraph = "0.5.1"
 phf = { version = "0.10.1", features = ["macros"] }

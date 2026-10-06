@@ -15,7 +15,7 @@ use cachet_lang::ast::{
 };
 pub use cachet_lang::normalizer::{LocalLabelIndex, LocalVarIndex};
 
-use cachet_util::{box_from, chain_from, deref_from, fmt_join, fmt_join_trailing, AffixWriter};
+use cachet_util::{AffixWriter, box_from, chain_from, deref_from, fmt_join, fmt_join_trailing};
 
 #[derive(Clone, Copy, Debug, Display)]
 #[display(fmt = "{}_{}", kind, ident)]
@@ -322,6 +322,10 @@ impl FnIdent {
 pub enum HelperFnIdent {
     #[display(fmt = "Cachet_Assert")]
     Assert,
+    /// Must be declared `[[noreturn]]` by the embedder: it stands in for the
+    /// return a value-returning function would otherwise need.
+    #[display(fmt = "Cachet_Unreachable")]
+    Unreachable,
 }
 
 #[derive(Clone, Copy, Debug, Display, From)]

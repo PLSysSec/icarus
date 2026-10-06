@@ -9,8 +9,8 @@ use thiserror::Error;
 
 use cachet_util::fmt_join_or;
 
-use crate::ast::{labels, FileId, Ident, Path, Span, Spanned};
 use crate::FrontendError;
+use crate::ast::{FileId, Ident, Path, Span, Spanned, labels};
 
 // TODO(spinda): Break up TypeCheckError like ResolveError.
 #[derive(Debug, Error)]
@@ -371,7 +371,11 @@ impl FrontendError for TypeCheckError {
                 found_arg_kinds,
                 ..
             } => {
-                format!("expected {}, found {}", expected_arg_kind, ArgKinds(found_arg_kinds))
+                format!(
+                    "expected {}, found {}",
+                    expected_arg_kind,
+                    ArgKinds(found_arg_kinds)
+                )
             }
             TypeCheckError::ArgTypeMismatch {
                 expected_type: expected,

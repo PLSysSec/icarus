@@ -1,7 +1,7 @@
 // vim: set tw=99 ts=4 sts=4 sw=4 et:
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 
 use enumset::EnumSet;

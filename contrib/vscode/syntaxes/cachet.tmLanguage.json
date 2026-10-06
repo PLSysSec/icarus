@@ -1,0 +1,144 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Cachet",
+  "scopeName": "source.cachet",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#attributes" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#declarations" },
+    { "include": "#verification" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#types" },
+    { "include": "#paths" },
+    { "include": "#calls" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.cachet",
+          "begin": "//",
+          "end": "$",
+          "patterns": [{ "include": "#todo" }]
+        },
+        {
+          "name": "comment.block.cachet",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [{ "include": "#todo" }]
+        }
+      ]
+    },
+    "todo": {
+      "match": "\\b(TODO|FIXME|XXX|NB|NOTE|SAFETY)\\b",
+      "name": "keyword.other.todo.cachet"
+    },
+    "attributes": {
+      "name": "meta.attribute.cachet",
+      "begin": "#\\[",
+      "end": "\\]",
+      "beginCaptures": { "0": { "name": "punctuation.definition.attribute.cachet" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.attribute.cachet" } },
+      "patterns": [
+        {
+          "match": "\\b(spec|refined|inline|prelude|reads|writes|cfg)\\b",
+          "name": "entity.name.function.attribute.cachet"
+        },
+        { "include": "#strings" },
+        { "match": "[A-Za-z_][A-Za-z0-9_]*", "name": "variable.parameter.attribute.cachet" }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.cachet",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.cachet" }]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "match": "\\b[0-9]+_[iu](8|16|32|64)\\b",
+          "name": "constant.numeric.integer.cachet"
+        },
+        { "match": "\\b[0-9]+\\.[0-9]+\\b", "name": "constant.numeric.float.cachet" },
+        { "match": "\\b[0-9]+\\b", "name": "constant.numeric.cachet" }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(fn|op)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.cachet" },
+            "2": { "name": "entity.name.function.cachet" }
+          }
+        },
+        {
+          "match": "\\b(ir|struct|enum|impl)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.cachet" },
+            "2": { "name": "entity.name.type.cachet" }
+          }
+        },
+        {
+          "match": "\\b(label)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.cachet" },
+            "2": { "name": "entity.name.label.cachet" }
+          }
+        }
+      ]
+    },
+    "verification": {
+      "match": "\\b(assert|assume|unsafe)\\b",
+      "name": "keyword.control.exception.cachet"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(if|else|for|in|goto|return|unreachable|emit)\\b",
+          "name": "keyword.control.cachet"
+        },
+        {
+          "match": "\\b(import|emits|let|var|out|bind|mut|as|asc|desc|left|right)\\b",
+          "name": "keyword.other.cachet"
+        },
+        { "match": "\\b(ir|struct|enum|impl|fn|op|label)\\b", "name": "storage.type.cachet" }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        { "match": "\\b(true|false)\\b", "name": "constant.language.boolean.cachet" },
+        { "match": "\\bunit\\b", "name": "constant.language.unit.cachet" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "match": "\\b(Unit|Bool|Int8|Int16|Int32|Int64|UInt8|UInt16|UInt32|UInt64|Double)\\b",
+          "name": "support.type.primitive.cachet"
+        },
+        { "match": "\\b[A-Z][A-Za-z0-9_]*\\b", "name": "entity.name.type.cachet" }
+      ]
+    },
+    "paths": {
+      "match": "::",
+      "name": "punctuation.separator.namespace.cachet"
+    },
+    "calls": {
+      "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "name": "entity.name.function.call.cachet"
+    },
+    "operators": {
+      "patterns": [
+        { "match": "<:", "name": "keyword.operator.subtype.cachet" },
+        { "match": "&&|\\|\\|", "name": "keyword.operator.logical.cachet" },
+        { "match": "[+\\-*/%^&|!<>=]=?", "name": "keyword.operator.cachet" }
+      ]
+    }
+  }
+}

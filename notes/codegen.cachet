@@ -112,6 +112,13 @@ fn emitGuardToInt32ForToNumber(valueId: ValueId, value: Value) emits CacheIR -> 
     }
 }
 
+fn emitGuardToNumber(valueId: ValueId, value: Value) emits CacheIR -> NumberId {
+    // Do we need to support null & bool as above? 
+    assert Value::isNumber(value);
+    emit CacheIR::GuardIsNumber(valueId);
+    return OperandId::toNumberId(valueId);
+}
+
 fn emitIdGuard(keyValueId: ValueId, keyValue: Value, key: PropertyKey) emits CacheIR {
     if PropertyKey::isSymbol(key) {
         let symbol = PropertyKey::toSymbol(key);

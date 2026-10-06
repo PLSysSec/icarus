@@ -17,7 +17,7 @@ use regex::Regex;
 use similar_asserts::assert_eq;
 
 use bpl::ast::BoogieProgram;
-use bpl::parser::{parse_boogie_program, ParseError};
+use bpl::parser::{ParseError, parse_boogie_program};
 
 include!(concat!(env!("OUT_DIR"), "/test.rs"));
 

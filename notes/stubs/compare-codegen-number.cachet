@@ -1,0 +1,42 @@
+import "../cacheir.cachet";
+import "../codegen.cachet";
+import "../js.cachet";
+import "../utils.cachet";
+
+
+ir CompareIRGenerator emits CacheIR {
+    var lhsValue: Value;
+    var rhsValue: Value;
+    var op_: JSOp;
+
+    op TryAttachNumber() {
+        initRegState();
+        let lhsValueId = CacheIR::defineInputValueId();
+        let rhsValueId = CacheIR::defineInputValueId();
+        initValueOutput();
+
+        assume CompareIRGenerator::op_ == JSOp::Eq ||
+            CompareIRGenerator::op_ == JSOp::StrictEq ||
+            CompareIRGenerator::op_ == JSOp::Ne ||
+            CompareIRGenerator::op_ == JSOp::StrictNe ||
+            CompareIRGenerator::op_ == JSOp::Lt ||
+            CompareIRGenerator::op_ == JSOp::Le ||
+            CompareIRGenerator::op_ == JSOp::Gt ||
+            CompareIRGenerator::op_ == JSOp::Ge;
+        
+        if !Value::isNumber(CompareIRGenerator::lhsValue) ||
+            !Value::isNumber(CompareIRGenerator::rhsValue)
+        {
+            return;
+        }
+
+        let lhsDoubleId = emitGuardToNumber(lhsValueId, CompareIRGenerator::lhsValue);
+        let rhsDoubleId = emitGuardToNumber(rhsValueId, CompareIRGenerator::rhsValue);
+
+        emit CacheIR::CompareDoubleResult(CompareIRGenerator::op_, lhsDoubleId, rhsDoubleId);
+        emit CacheIR::ReturnFromIC();
+
+    }
+}
+
+

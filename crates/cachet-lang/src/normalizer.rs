@@ -354,7 +354,6 @@ impl<'a, 'b> ScopedNormalizer<'a, 'b> {
         match stmt {
             type_checker::Stmt::Let(let_stmt) => self.normalize_let_stmt(let_stmt),
             type_checker::Stmt::Label(label_stmt) => self.stmts.push(label_stmt.into()),
-            type_checker::Stmt::If(if_stmt) => self.normalize_if_stmt(if_stmt),
             type_checker::Stmt::ForIn(for_in_stmt) => self.normalize_for_in_stmt(for_in_stmt),
             type_checker::Stmt::Check(check_stmt) => self.normalize_check_stmt(check_stmt),
             type_checker::Stmt::Goto(goto_stmt) => self.stmts.push(goto_stmt.into()),
@@ -362,6 +361,7 @@ impl<'a, 'b> ScopedNormalizer<'a, 'b> {
             type_checker::Stmt::Emit(emit_stmt) => self.normalize_emit_stmt(emit_stmt),
             type_checker::Stmt::Expr(expr) => self.normalize_unused_expr(expr),
             type_checker::Stmt::Ret(ret_stmt) => self.normalize_ret_stmt(ret_stmt),
+            type_checker::Stmt::Unreachable => self.stmts.push(Stmt::Unreachable),
         }
     }
 
@@ -378,24 +378,75 @@ impl<'a, 'b> ScopedNormalizer<'a, 'b> {
         );
     }
 
-    fn normalize_if_stmt_recurse(&mut self, if_stmt: type_checker::IfStmt) -> IfStmt {
-        let cond = self.normalize_expr(if_stmt.cond);
-        let then = self.normalize_unused_block(if_stmt.then);
-        let else_ = if_stmt.else_.map(|else_| match else_ {
+    /// Lowers an `if` to the statement the backends understand, with each arm
+    /// assigning its value to `target` where there is one.
+    ///
+    /// The condition's own statements go to `self.stmts`, ahead of the `if`, the
+    /// condition being evaluated on every path.
+    fn normalize_if_expr_recurse(
+        &mut self,
+        if_expr: type_checker::IfExpr,
+        target: Option<VarIndex>,
+    ) -> IfStmt {
+        let cond = self.normalize_expr(if_expr.cond);
+        let then = self.normalize_arm(if_expr.then, target);
+        let else_ = if_expr.else_.map(|else_| match else_ {
             type_checker::ElseClause::Else(else_block) => {
-                ast::ElseClause::Else(self.normalize_unused_block(else_block))
+                ast::ElseClause::Else(self.normalize_arm(else_block, target))
             }
             type_checker::ElseClause::ElseIf(else_if) => {
-                ast::ElseClause::ElseIf(Box::new(self.normalize_if_stmt_recurse(*else_if)))
+                ast::ElseClause::ElseIf(Box::new(self.normalize_if_expr_recurse(*else_if, target)))
             }
         });
 
         IfStmt { cond, then, else_ }
     }
 
-    fn normalize_if_stmt(&mut self, if_stmt: type_checker::IfStmt) {
-        let if_ = self.normalize_if_stmt_recurse(if_stmt);
+    /// One arm of an `if`, assigning its value to `target` where there is one.
+    ///
+    /// `None` is the statement-position case, which discards the arms' values. An arm
+    /// that exits early discards its value either way: the value is never reached --
+    /// it is the `unit` standing in for a missing one -- so assigning it would be
+    /// ill-typed as well as unreachable.
+    ///
+    /// The arm's work rides along inside a block expression, which the flattener
+    /// hoists into the arm. That keeps it conditional, the same way the `&&` lowering
+    /// in [`ScopedNormalizer::normalize_used_bin_oper_expr`] keeps its right operand
+    /// conditional.
+    fn normalize_arm(
+        &mut self,
+        block: type_checker::Block,
+        target: Option<VarIndex>,
+    ) -> Vec<Stmt> {
+        let Some(target) = target.filter(|_| !block.exits_early) else {
+            return self.normalize_unused_block(block);
+        };
+
+        let value = self.normalize_used_block_expr(block.into());
+        vec![
+            AssignStmt {
+                lhs: target,
+                rhs: value,
+            }
+            .into(),
+        ]
+    }
+
+    /// An `if` in statement position, where the arms' values go nowhere.
+    fn normalize_unused_if_expr(&mut self, if_expr: type_checker::IfExpr) {
+        let if_ = self.normalize_if_expr_recurse(if_expr, None);
         self.stmts.push(if_.into());
+    }
+
+    /// An `if` whose value is wanted. Neither backend has a conditional expression,
+    /// so it becomes a local the arms assign to, and the local is the value.
+    fn normalize_used_if_expr(&mut self, if_expr: type_checker::IfExpr) -> Expr {
+        let output_var_expr = self.push_mut_tmp_expr(if_expr.type_());
+
+        let if_ = self.normalize_if_expr_recurse(if_expr, Some(output_var_expr.var.into()));
+        self.stmts.push(if_.into());
+
+        output_var_expr.into()
     }
 
     fn normalize_for_in_stmt(&mut self, for_in_stmt: type_checker::ForInStmt) {
@@ -479,6 +530,7 @@ impl<'a, 'b> ScopedNormalizer<'a, 'b> {
 
         match expr {
             type_checker::Expr::Block(block) => self.normalize_used_block_expr(*block),
+            type_checker::Expr::If(if_expr) => self.normalize_used_if_expr(*if_expr),
             type_checker::Expr::Literal(literal) => literal.into(),
             type_checker::Expr::Var(var_expr) => var_expr.into(),
             type_checker::Expr::Invoke(invoke_expr) => {
@@ -505,6 +557,7 @@ impl<'a, 'b> ScopedNormalizer<'a, 'b> {
     fn normalize_unused_expr(&mut self, expr: type_checker::Expr) {
         match expr {
             type_checker::Expr::Block(block) => self.normalize_unused_block_expr(*block),
+            type_checker::Expr::If(if_expr) => self.normalize_unused_if_expr(*if_expr),
             type_checker::Expr::Literal(_) => (),
             type_checker::Expr::Var(_) => (),
             type_checker::Expr::Invoke(invoke_expr) => {
@@ -758,6 +811,35 @@ impl<'a, 'b> ScopedNormalizer<'a, 'b> {
         VarExpr {
             var: tmp_local_var_index.into(),
             type_: tmp_local_var_type_index,
+        }
+    }
+
+    /// A mutable local with no initial value, to hold a result several paths assign.
+    ///
+    /// [`ScopedNormalizer::push_tmp_expr`]'s temp is immutable and initialized, which
+    /// a result computed by branches cannot be: each branch supplies the value, and
+    /// there is nothing to initialize it with beforehand -- nor any way to invent a
+    /// value for an arbitrary type. An absent initializer is already what a fresh
+    /// `out` argument's declaration relies on; see [`ScopedNormalizer::normalize_arg`].
+    fn push_mut_tmp_expr(&mut self, type_: TypeIndex) -> VarExpr {
+        let tmp_local_var_index = self.local_vars.push_and_get_key(LocalVar {
+            ident: Spanned::new(Span::Internal, *TMP_VAR_IDENT),
+            is_mut: true,
+            type_,
+        });
+
+        self.stmts.push(
+            LetStmt {
+                lhs: tmp_local_var_index,
+                type_,
+                rhs: None,
+            }
+            .into(),
+        );
+
+        VarExpr {
+            var: tmp_local_var_index.into(),
+            type_,
         }
     }
 

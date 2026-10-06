@@ -1458,6 +1458,30 @@ ir CacheIR emits MASM {
 
     }
 
+    // from CacheIRCompiler.cpp emitCompareDoubleResult
+    op CompareDoubleResult(jsop: JSOp, lhsId: NumberId, rhsId: NumberId) {
+
+        let lhsReg = FloatReg::floatReg0(); 
+        let rhsReg = FloatReg::floatReg1(); 
+
+        assert !FloatRegSet::contains(CacheIR::liveFloatRegSet, lhsReg);
+        assert !FloatRegSet::contains(CacheIR::liveFloatRegSet, rhsReg);
+
+        CacheIR::ensureDoubleRegister(lhsId, lhsReg);
+        CacheIR::ensureDoubleRegister(rhsId, rhsReg);
+
+        label ifTrue: MASM;
+        label done: MASM;
+
+        emit MASM::BranchDouble(DoubleCondition::fromJSOp(jsop), lhsReg, rhsReg, ifTrue);
+        CacheIR::emitStoreBool(false, CacheIR::outputReg);
+        emit MASM::Jump(done);
+
+        bind ifTrue;
+        CacheIR::emitStoreBool(true, CacheIR::outputReg);
+        bind done;
+    }
+
     op Int32AddResult(lhsId: Int32Id, rhsId: Int32Id) {
         let lhsReg = CacheIR::useInt32Id(lhsId);
         let rhsReg = CacheIR::useInt32Id(rhsId);

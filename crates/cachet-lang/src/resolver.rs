@@ -13,13 +13,13 @@ use enum_iterator::IntoEnumIterator;
 use enumset::EnumSet;
 use typed_index_collections::{TiSlice, TiVec};
 
-use cachet_util::{collect_eager, deref_from, MaybeOwned};
+use cachet_util::{MaybeOwned, collect_eager, deref_from};
 
+use crate::FrontendError;
 use crate::ast::{Ident, Path, Spanned};
 use crate::built_in::{BuiltInAttr, BuiltInType, BuiltInVar, IdentEnum};
 use crate::parser;
 use crate::util::map_spanned;
-use crate::FrontendError;
 
 pub use crate::resolver::ast::*;
 pub use crate::resolver::error::*;
@@ -899,8 +899,8 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
         self.recurse().resolve_block_impl(block)
     }
 
-    fn resolve_nested_elseif(&mut self, if_stmt: Box<parser::IfStmt>) -> Option<Box<IfStmt>> {
-        self.recurse().resolve_if_stmt(*if_stmt).map(Box::new)
+    fn resolve_nested_elseif(&mut self, if_expr: Box<parser::IfExpr>) -> Option<Box<IfExpr>> {
+        self.recurse().resolve_if_expr(*if_expr).map(Box::new)
     }
 
     /// This is deliberately *not* named `resolve_block`, to force explicit
@@ -942,9 +942,6 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
     fn resolve_stmt(&mut self, stmt: parser::Stmt) -> Option<Option<Stmt>> {
         match stmt {
             parser::Stmt::Comment(_) => Some(None),
-            parser::Stmt::Block(block) => {
-                self.resolve_kinded_block(block).map(Stmt::from).map(Some)
-            }
             parser::Stmt::Let(let_stmt) => {
                 self.resolve_let_stmt(let_stmt).map(Stmt::from).map(Some)
             }
@@ -952,7 +949,6 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
                 .resolve_label_stmt(label_stmt)
                 .map(Stmt::from)
                 .map(Some),
-            parser::Stmt::If(if_stmt) => self.resolve_if_stmt(if_stmt).map(Stmt::from).map(Some),
             parser::Stmt::ForIn(for_in_stmt) => self
                 .resolve_for_in_stmt(for_in_stmt)
                 .map(Stmt::from)
@@ -978,7 +974,9 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
             parser::Stmt::Ret(ret_stmt) => {
                 self.resolve_ret_stmt(ret_stmt).map(Stmt::from).map(Some)
             }
-            parser::Stmt::Expr(expr) => self.resolve_expr(expr).map(Stmt::from).map(Some),
+            parser::Stmt::Unreachable => Some(Some(Stmt::Unreachable)),
+            parser::Stmt::Expr(expr) => self.resolve_expr(expr).map(Stmt::Expr).map(Some),
+            parser::Stmt::Semi(expr) => self.resolve_expr(expr).map(Stmt::Semi).map(Some),
         }
     }
 
@@ -1007,12 +1005,12 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
         })
     }
 
-    fn resolve_if_stmt(&mut self, if_stmt: parser::IfStmt) -> Option<IfStmt> {
-        let cond = map_spanned(if_stmt.cond, |cond| self.resolve_expr(cond.value));
+    fn resolve_if_expr(&mut self, if_expr: parser::IfExpr) -> Option<IfExpr> {
+        let cond = map_spanned(if_expr.cond, |cond| self.resolve_expr(cond.value));
 
-        let then = self.resolve_nested_block(if_stmt.then);
+        let then = self.resolve_nested_block(if_expr.then);
 
-        let else_ = match if_stmt.else_ {
+        let else_ = match if_expr.else_ {
             Some(parser::ElseClause::ElseIf(elseif_)) => self
                 // TODO(spinda): What's this doing? Should we really be
                 // recursing here?
@@ -1026,7 +1024,7 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
             None => Some(None),
         };
 
-        Some(IfStmt {
+        Some(IfExpr {
             cond: cond?,
             then: then?,
             else_: else_?,
@@ -1104,6 +1102,7 @@ impl<'a, 'b> ScopedResolver<'a, 'b> {
     fn resolve_expr(&mut self, expr: parser::Expr) -> Option<Expr> {
         match expr {
             parser::Expr::Block(block) => self.resolve_kinded_block(*block).map(Expr::from),
+            parser::Expr::If(if_expr) => self.resolve_if_expr(*if_expr).map(Expr::from),
             parser::Expr::Literal(literal) => Some(literal.into()),
             parser::Expr::Var(var_path) => self.resolve_var_expr(var_path).map(Expr::from),
             parser::Expr::Invoke(call) => self

@@ -204,6 +204,7 @@ pub enum Stmt<B = ()> {
     Assign(AssignStmt<B>),
     #[from]
     Ret(RetStmt<B>),
+    Unreachable,
 }
 
 #[derive(Clone, Debug)]

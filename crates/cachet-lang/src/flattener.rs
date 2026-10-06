@@ -146,6 +146,9 @@ impl Flattener {
             normalizer::Stmt::Ret(ret_stmt) => {
                 self.flatten_ret_stmt(ret_stmt);
             }
+            normalizer::Stmt::Unreachable => {
+                self.stmts.push(Stmt::Unreachable);
+            }
         }
     }
 

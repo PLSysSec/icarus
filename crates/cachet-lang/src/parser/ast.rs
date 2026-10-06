@@ -8,7 +8,7 @@ use derive_more::{Display, From};
 use typed_index_collections::TiVec;
 
 use cachet_util::{
-    box_from, deref_from, fmt_join, fmt_join_trailing, typed_field_index, AffixWriter,
+    AffixWriter, box_from, deref_from, fmt_join, fmt_join_trailing, typed_field_index,
 };
 
 use crate::ast::{
@@ -43,7 +43,7 @@ impl FromIterator<Spanned<Item>> for Mod {
     }
 }
 
-#[derive(Clone, Debug, Display, From)]
+#[derive(Clone, Debug, From)]
 pub enum Item {
     #[from]
     Comment(Comment),
@@ -61,6 +61,24 @@ pub enum Item {
     GlobalVar(GlobalVarItem),
     Fn(CallableItem),
     Op(CallableItem),
+}
+
+impl Display for Item {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            Item::Comment(item) => write!(f, "{item}"),
+            Item::Enum(item) => write!(f, "{item}"),
+            Item::Import(item) => write!(f, "{item}"),
+            Item::Struct(item) => write!(f, "{item}"),
+            Item::Ir(item) => write!(f, "{item}"),
+            Item::Impl(item) => write!(f, "{item}"),
+            Item::GlobalVar(item) => write!(f, "{item}"),
+            // The keyword belongs to the variant, not to `CallableItem`, which
+            // is identical for both.
+            Item::Fn(item) => item.fmt_with_keyword(f, "fn"),
+            Item::Op(item) => item.fmt_with_keyword(f, "op"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -226,16 +244,25 @@ pub struct CallableItem {
     pub body: Spanned<Option<Block>>,
 }
 
-impl Display for CallableItem {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+impl CallableItem {
+    /// `fn` and `op` items differ only in that keyword, and which one this is
+    /// lives in the enclosing [`Item`] variant rather than here. The keyword
+    /// can't simply be prepended to this rendering, because attributes and
+    /// `unsafe` come before it.
+    fn fmt_with_keyword(&self, f: &mut fmt::Formatter, keyword: &str) -> Result<(), fmt::Error> {
         fmt_join_trailing(f, "\n", self.attrs.iter())?;
 
         if self.is_unsafe {
             write!(f, "unsafe ")?;
         }
-        write!(f, "op {}(", self.ident)?;
+        write!(f, "{keyword} {}(", self.ident)?;
         fmt_join(f, ", ", self.params.iter())?;
         write!(f, ")")?;
+
+        // Between the parameters and the return type, as the grammar has it.
+        if let Some(emits) = &self.emits {
+            write!(f, " emits {emits}")?;
+        }
 
         if let Some(ret) = &self.ret {
             write!(f, " -> {ret}")?;
@@ -457,18 +484,10 @@ impl From<Block> for KindedBlock {
 pub enum Stmt {
     #[from]
     Comment(Comment),
-    /// Represents a freestanding block in the statement position, *without*
-    /// a trailing semicolon. Requires that the block be unit-typed. A trailing
-    /// semicolon should cause the block to be parsed as an expression
-    /// statement, which ignores the type.
-    #[from(types(Block))]
-    Block(KindedBlock),
     #[from]
     Let(LetStmt),
     #[from]
     Label(LabelStmt),
-    #[from]
-    If(IfStmt),
     #[from]
     ForIn(ForInStmt),
     #[from]
@@ -481,9 +500,18 @@ pub enum Stmt {
     Emit(Call),
     #[from]
     Ret(RetStmt),
-    #[display(fmt = "{_0};")]
-    #[from]
+    #[display(fmt = "unreachable;")]
+    Unreachable,
+    /// An expression in statement position with **no** trailing semicolon, which
+    /// requires it to be unit-typed. Only the expressions that can stand alone
+    /// without one get here -- a block or an `if`, the grammar's `BlockExpr` -- so
+    /// `{ 1 1 }` stays a parse error.
+    #[display(fmt = "{}", "Unparenthesized(_0)")]
     Expr(Expr),
+    /// An expression in statement position **with** a trailing semicolon, which
+    /// discards its value whatever the type.
+    #[display(fmt = "{_0};")]
+    Semi(Expr),
 }
 
 #[derive(Clone, Debug, Display)]
@@ -509,13 +537,13 @@ pub struct ForInStmt {
 }
 
 #[derive(Clone, Debug)]
-pub struct IfStmt {
+pub struct IfExpr {
     pub cond: Spanned<Expr>,
     pub then: Block,
     pub else_: Option<ElseClause>,
 }
 
-impl Display for IfStmt {
+impl Display for IfExpr {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "if {} {}", self.cond, self.then)?;
         if let Some(else_) = &self.else_ {
@@ -529,12 +557,12 @@ impl Display for IfStmt {
 #[display(fmt = "else {}")]
 pub enum ElseClause {
     #[from]
-    ElseIf(Box<IfStmt>),
+    ElseIf(Box<IfExpr>),
     #[from]
     Else(Block),
 }
 
-box_from!(IfStmt => ElseClause);
+box_from!(IfExpr => ElseClause);
 
 #[derive(Clone, Debug, Display)]
 #[display(fmt = "{kind} {cond};")]
@@ -576,6 +604,8 @@ pub enum Expr {
     #[from]
     Block(Box<KindedBlock>),
     #[from]
+    If(Box<IfExpr>),
+    #[from]
     Literal(Literal),
     #[from]
     Var(Spanned<Path>),
@@ -593,6 +623,7 @@ pub enum Expr {
 }
 
 box_from!(KindedBlock => Expr);
+box_from!(IfExpr => Expr);
 box_from!(NegateExpr => Expr);
 box_from!(FieldAccess => Expr);
 box_from!(CastExpr => Expr);
@@ -723,12 +754,31 @@ impl<T: Display> Display for CommaTerminated<'_, T> {
     }
 }
 
+/// An expression in statement position with no trailing semicolon, which the grammar
+/// admits only for a block or an `if`.
+///
+/// Those have to print *bare*: `Expr::Block`'s own `Display` parenthesizes, which is
+/// harmless in operand position but makes `({ .. })` as a statement unparseable --
+/// `BlockOrStmt` takes a `BlockExpr`, not a grouped expression.
+struct Unparenthesized<'a>(&'a Expr);
+
+impl Display for Unparenthesized<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self.0 {
+            Expr::Block(kinded_block) => Display::fmt(kinded_block, f),
+            expr => Display::fmt(expr, f),
+        }
+    }
+}
+
 struct MaybeGrouped<'a>(&'a Expr);
 
 impl Display for MaybeGrouped<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         let needs_group = match self.0 {
+            // An `if` is self-delimiting, like a block: its arms are braced.
             Expr::Block(_)
+            | Expr::If(_)
             | Expr::Literal(_)
             | Expr::Var(_)
             | Expr::Invoke(_)

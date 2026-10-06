@@ -1,10 +1,7 @@
 // vim: set tw=99 ts=4 sts=4 sw=4 et:
 
-#![feature(let_chains)]
-#![feature(type_alias_impl_trait)]
-
-pub use bpl::{compile as compile_bpl, BplCode};
-pub use cpp::{compile as compile_cpp, CppCode, CppCompilerOutput};
+pub use bpl::{BplCode, compile as compile_bpl};
+pub use cpp::{CppCode, CppCompilerOutput, compile as compile_cpp};
 
 mod bpl;
 mod cpp;

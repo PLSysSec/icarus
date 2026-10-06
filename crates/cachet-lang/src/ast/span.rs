@@ -84,7 +84,10 @@ impl<T> Spanned<T> {
     }
 
     pub const fn internal(value: T) -> Self {
-        Self { span: Span::Internal, value }
+        Self {
+            span: Span::Internal,
+            value,
+        }
     }
 
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {

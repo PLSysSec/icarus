@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use cachet_util::fmt_join_or;
 
-use crate::ast::{labels, FileId, Ident, Path, Span, Spanned};
 use crate::FrontendError;
+use crate::ast::{FileId, Ident, Path, Span, Spanned, labels};
 
 #[derive(Clone, Debug, Error)]
 pub enum ResolveError {

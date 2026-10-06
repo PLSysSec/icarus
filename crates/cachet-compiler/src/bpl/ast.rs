@@ -16,7 +16,7 @@ use cachet_lang::ast::{
 };
 pub use cachet_lang::normalizer::{LocalLabelIndex, LocalVarIndex};
 use cachet_util::{
-    box_from, deref_from, fmt_join, fmt_join_leading, fmt_join_trailing, typed_index, AffixWriter,
+    AffixWriter, box_from, deref_from, fmt_join, fmt_join_leading, fmt_join_trailing, typed_index,
 };
 
 #[derive(Clone, Copy, Debug, Display, From)]

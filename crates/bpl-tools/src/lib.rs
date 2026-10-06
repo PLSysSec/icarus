@@ -1,8 +1,5 @@
 // vim: set tw=99 ts=4 sts=4 sw=4 et:
 
-#![feature(anonymous_lifetime_in_impl_trait)]
-#![feature(let_chains)]
-
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
@@ -14,8 +11,8 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::{Dfs, VisitMap, Visitable};
 
 use bpl::ast::*;
-use bpl::parser::parse_boogie_program;
 pub use bpl::parser::ParseError;
+use bpl::parser::parse_boogie_program;
 
 lazy_static! {
     static ref INLINE_ATTR_IDENT: Ident = Ident::from("inline");
@@ -174,7 +171,7 @@ fn decl_is_axiom(decl: &Decl) -> bool {
     }
 }
 
-fn has_attr(attrs: impl IntoIterator<Item = &Attr>, attr_ident: Ident) -> bool {
+fn has_attr<'a>(attrs: impl IntoIterator<Item = &'a Attr>, attr_ident: Ident) -> bool {
     attrs.into_iter().any(|attr| match attr {
         AttrOrTrigger::Attr(attr_content) => attr_content.ident == attr_ident,
         AttrOrTrigger::Trigger(_) => false,
@@ -690,7 +687,9 @@ impl<'a, F> NestedReachabilityVisitor<'a, F> {
 
     fn visit_contract_specs(&mut self, specs: &[Spec], kind: ContractKind) {
         for spec in specs {
-            if let Spec::Contract(contract_spec) = spec && contract_spec.kind == kind {
+            if let Spec::Contract(contract_spec) = spec
+                && contract_spec.kind == kind
+            {
                 self.visit_contract_spec(contract_spec);
             }
         }
@@ -1151,7 +1150,7 @@ impl<'a, F> NestedReachabilityVisitor<'a, F> {
         );
     }
 
-    fn visit_attrs(&mut self, attrs: impl IntoIterator<Item = &Attr>) {
+    fn visit_attrs<'b>(&mut self, attrs: impl IntoIterator<Item = &'b Attr>) {
         for attr in attrs.into_iter() {
             self.visit_attr(attr);
         }

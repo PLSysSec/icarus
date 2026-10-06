@@ -1,0 +1,71 @@
+// phoenix: complete translation of js::jit::CompareIRGenerator::tryAttachInt32.
+// 4 construct(s) deliberately elided.
+
+import "../cacheir.cachet";
+
+import "../js.cachet";
+
+import "../utils.cachet";
+
+fn CanConvertToInt32ForToNumber(v: Value) -> Bool {  
+  return (Value::isInt32(v) || Value::isBool(v)) || Value::isNull(v);
+}
+
+fn EmitGuardToInt32ForToNumber(id: ValueId, v: Value) emits CacheIR -> Int32Id {  
+  if Value::isInt32(v) {  
+    return guardToInt32(id);
+  }
+  if Value::isNull(v) {  
+    emit CacheIR::GuardIsNull(id);
+    return loadInt32Constant(0_i32);
+  }
+  // unhandled assertion:
+  // MOZ_ASSERT(v.isBoolean());
+  return guardBooleanToInt32(id);
+}
+
+fn guardToInt32(input: ValueId) emits CacheIR -> Int32Id {  
+  emit CacheIR::GuardToInt32(input);
+  return OperandId::toInt32Id(input);
+}
+
+fn loadInt32Constant(val: Int32) emits CacheIR -> Int32Id {  
+  let valField = CacheIR::writeInt32Field(val);
+  let result = CacheIR::newInt32Id();
+  emit CacheIR::LoadInt32Constant(valField, result);
+  return result;
+}
+
+fn guardBooleanToInt32(input: ValueId) emits CacheIR -> Int32Id {  
+  let result = CacheIR::newInt32Id();
+  emit CacheIR::GuardBooleanToInt32(input, result);
+  return result;
+}
+
+ir CompareIRGenerator emits CacheIR {  
+  var lhsVal_: Value;
+  
+  var rhsVal_: Value;
+  
+  var op_: JSOp;
+  
+  op TryAttachInt32() {  
+    initRegState();
+    let lhsId = CacheIR::defineInputValueId();
+    let rhsId = CacheIR::defineInputValueId();
+    initValueOutput();
+    assume JSOp::isEqualityOp(CompareIRGenerator::op_) || JSOp::isRelationalOp(CompareIRGenerator::op_);
+    if (!CanConvertToInt32ForToNumber(CompareIRGenerator::lhsVal_)) || (!CanConvertToInt32ForToNumber(CompareIRGenerator::rhsVal_)) {  
+      return;
+    }
+    // unhandled assertion:
+    // MOZ_ASSERT_IF(op_ == JSOp::StrictEq || op_ == JSOp::StrictNe,
+    //               lhsVal_.type() == rhsVal_.type());
+    // unhandled assertion:
+    // MOZ_ASSERT_IF(lhsVal_.isNull() || rhsVal_.isNull(), !IsEqualityOp(op_));
+    let lhsIntId = EmitGuardToInt32ForToNumber(lhsId, CompareIRGenerator::lhsVal_);
+    let rhsIntId = EmitGuardToInt32ForToNumber(rhsId, CompareIRGenerator::rhsVal_);
+    emit CacheIR::CompareInt32Result(CompareIRGenerator::op_, lhsIntId, rhsIntId);
+    return;
+  }
+}

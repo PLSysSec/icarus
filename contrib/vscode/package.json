@@ -1,0 +1,26 @@
+{
+  "name": "cachet",
+  "displayName": "Cachet / Icarus",
+  "description": "Syntax highlighting for the Cachet (Icarus) verified-JIT DSL.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "cachet",
+        "aliases": ["Cachet", "Icarus", "cachet"],
+        "extensions": [".cachet"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "cachet",
+        "scopeName": "source.cachet",
+        "path": "./syntaxes/cachet.tmLanguage.json"
+      }
+    ]
+  }
+}

@@ -6,4 +6,4 @@ license = "MPL-2.0"
 description = """
 Support utilities for Cachet
 """
-edition = "2021"
+edition = "2024"

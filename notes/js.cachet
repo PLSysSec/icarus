@@ -276,6 +276,13 @@ enum MIRType {
 struct Float32;
 struct Float64;
 
+enum FloatComparison {
+    LessThan,
+    GreaterThan,
+    Equal,
+    Unordered
+}
+
 impl Float64 {
     fn isNegativeZero(float64: Float64) -> Bool;
     fn isInfinite(float64: Float64) -> Bool;
@@ -327,6 +334,14 @@ impl Float64 {
     }
 
     unsafe fn fromUInt32Unchecked(uint32: UInt32) -> Float64;
+
+    unsafe fn compareUnchecked(lhs: Float64, rhs: Float64) -> FloatComparison;
+
+    fn compare(lhs: Float64, rhs: Float64) -> FloatComparison {
+        let result = (unsafe {Float64::compareUnchecked(lhs, rhs)});
+        assume (result == FloatComparison::Unordered) == (Float64::isNaN(lhs) || Float64::isNaN(rhs));
+        result
+    }
 }
 
 struct Simd128;

@@ -118,6 +118,10 @@ impl FloatReg {
         FloatReg::newDouble(PhyFloatReg::Xmm0)
     }
 
+    fn floatReg1() -> FloatReg {
+        FloatReg::newDouble(PhyFloatReg::Xmm1)
+    }
+
     fn doubleScratchReg() -> FloatReg {
         FloatReg::newDouble(PhyFloatReg::Xmm15)
     }
@@ -622,6 +626,48 @@ impl Condition {
         }
     }
 }
+
+enum DoubleCondition {
+    DoubleOrdered,
+    DoubleEqual,
+    DoubleNotEqual,
+    DoubleGreaterThan,
+    DoubleGreaterThanOrEqual,
+    DoubleLessThan,
+    DoubleLessThanOrEqual,
+    DoubleUnordered,
+    DoubleEqualOrUnordered,
+    DoubleNotEqualOrUnordered,
+    DoubleGreaterThanOrUnordered,
+    DoubleGreaterThanOrEqualOrUnordered,
+    DoubleLessThanOrUnordered,
+    DoubleLessThanOrEqualOrUnordered,
+}
+
+impl DoubleCondition {
+    // From JSOpToDoubleCondition in MacroAssembler.h
+    fn fromJSOp(jsop: JSOp) -> DoubleCondition {
+        if jsop == JSOp::Eq || jsop == JSOp::StrictEq {
+            return DoubleCondition::DoubleEqual;
+        }
+        if jsop == JSOp::Ne || jsop == JSOp::StrictNe {
+            return DoubleCondition::DoubleNotEqualOrUnordered;
+        }
+        if jsop == JSOp::Lt {
+            return DoubleCondition::DoubleLessThan;
+        }
+        if jsop == JSOp::Le {
+            return DoubleCondition::DoubleLessThanOrEqual;
+        }
+        if jsop == JSOp::Gt {
+            return DoubleCondition::DoubleGreaterThan;
+        }
+
+        assert jsop == JSOp::Ge;
+        return DoubleCondition::DoubleGreaterThanOrEqual;
+    }
+}
+
 
 struct Address {
     base: Reg,
@@ -1629,6 +1675,56 @@ ir MASM {
             goto branch;
         }
     }
+
+    // signature from MacroAssembler.h (branchDouble)
+    op BranchDouble(condition: DoubleCondition, lhsReg: FloatReg, rhsReg: FloatReg, label branch: MASM) {
+        let lhsDouble = MASM::getDouble(lhsReg);
+        let rhsDouble = MASM::getDouble(rhsReg);
+        let cmp = Float64::compare(lhsDouble, rhsDouble); // Axiomatized 
+
+
+        // ---- ordered conditions: false when either operand is NaN ----
+        if condition == DoubleCondition::DoubleOrdered && cmp != FloatComparison::Unordered {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleEqual && cmp == FloatComparison::Equal {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleNotEqual &&
+                (cmp == FloatComparison::LessThan || cmp == FloatComparison::GreaterThan) {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleGreaterThan && cmp == FloatComparison::GreaterThan {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleGreaterThanOrEqual &&
+                (cmp == FloatComparison::GreaterThan || cmp == FloatComparison::Equal) {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleLessThan && cmp == FloatComparison::LessThan {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleLessThanOrEqual &&
+                (cmp == FloatComparison::LessThan || cmp == FloatComparison::Equal) {
+            goto branch;
+
+        // ---- unordered-permissive conditions: true when either operand is NaN ----
+        } else if condition == DoubleCondition::DoubleUnordered && cmp == FloatComparison::Unordered {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleEqualOrUnordered &&
+                (cmp == FloatComparison::Equal || cmp == FloatComparison::Unordered) {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleNotEqualOrUnordered && cmp != FloatComparison::Equal {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleGreaterThanOrUnordered &&
+                (cmp == FloatComparison::GreaterThan || cmp == FloatComparison::Unordered) {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleGreaterThanOrEqualOrUnordered &&
+                cmp != FloatComparison::LessThan {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleLessThanOrUnordered &&
+                (cmp == FloatComparison::LessThan || cmp == FloatComparison::Unordered) {
+            goto branch;
+        } else if condition == DoubleCondition::DoubleLessThanOrEqualOrUnordered &&
+                cmp != FloatComparison::GreaterThan {
+            goto branch;
+        }
+    }
+
 
     op Branch32(condition: Condition, lhsReg: Reg, rhsReg: Reg, label branch: MASM) {
         assert (

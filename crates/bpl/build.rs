@@ -88,9 +88,13 @@ impl TestCases {
 
         Ok(())
     }
-    
+
     fn generate_src(&self) -> TokenStream {
-        let TestCases { fn_idents, names, paths } = self;
+        let TestCases {
+            fn_idents,
+            names,
+            paths,
+        } = self;
         quote! {
             #(
                 #[test]

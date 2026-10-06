@@ -1,7 +1,7 @@
 // vim: set tw=99 ts=4 sts=4 sw=4 et:
 
 //use std::collections::HashSet;
-use std::io::{stdin, Read};
+use std::io::{Read, stdin};
 
 use nom::error::convert_error;
 

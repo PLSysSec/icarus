@@ -1,7 +1,5 @@
 // vim: set tw=99 ts=4 sts=4 sw=4 et:
 
-#![feature(is_some_and)]
-
 use std::fs;
 use std::io;
 use std::io::prelude::*;
@@ -14,10 +12,10 @@ use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 use lazy_static::lazy_static;
 use num_bigint::BigUint;
-use structopt::clap::AppSettings;
 use structopt::StructOpt;
+use structopt::clap::AppSettings;
 
-use bpl_tools::{inline_program, ParseError};
+use bpl_tools::{ParseError, inline_program};
 
 /// Preprocess code in the Boogie intermediate verification language to eagerly
 /// inline declarations.

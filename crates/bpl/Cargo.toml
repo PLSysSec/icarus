@@ -6,7 +6,7 @@ license = "MPL-2.0"
 description = """
 AST, parser, and printer for the Boogie intermediate verification language
 """
-edition = "2021"
+edition = "2024"
 
 [build-dependencies]
 anyhow = "1.0.28"
@@ -23,7 +23,7 @@ derive_more = "0.99.16"
 indent_write = "2.2.0"
 internment = "0.5.4"
 joinery = "3.1.0"
-lalrpop-util = { git = "https://github.com/PLSysSec/lalrpop", branch = "cachet" }
+lalrpop-util = { git = "https://github.com/PLSysSec/lalrpop", branch = "cachet", features = ["lexer"] }
 lazy_static = "1.4.0"
 phf = { version = "0.10.1", features = ["macros"] }
 

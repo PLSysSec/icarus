@@ -8,15 +8,15 @@ use anyhow::{Context, Error};
 use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 use iterate::iterate;
-use structopt::clap::AppSettings;
 use structopt::StructOpt;
+use structopt::clap::AppSettings;
 
+use cachet_lang::FrontendError;
 use cachet_lang::flattener::flatten;
 use cachet_lang::normalizer::normalize;
 use cachet_lang::parser::{Files, ParseError, Parser};
-use cachet_lang::resolver::{resolve, ResolveErrors};
-use cachet_lang::type_checker::{type_check, TypeCheckErrors};
-use cachet_lang::FrontendError;
+use cachet_lang::resolver::{ResolveErrors, resolve};
+use cachet_lang::type_checker::{TypeCheckErrors, type_check};
 
 use cachet_compiler::{compile_bpl, compile_cpp};
 

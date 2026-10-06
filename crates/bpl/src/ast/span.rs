@@ -1,5 +1,5 @@
-use std::fmt::{self, Debug, Display};
 use std::error;
+use std::fmt::{self, Debug, Display};
 
 pub use codespan::{ByteIndex, RawIndex, Span};
 

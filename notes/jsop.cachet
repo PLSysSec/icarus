@@ -236,4 +236,12 @@ impl JSOp {
     fn isLooseEqualityOp(jsop: JSOp) -> Bool {
         jsop == JSOp::Eq || jsop == JSOp::Ne
     }
+
+    fn isEqualityOp(jsop: JSOp) -> Bool {
+        JSOp::isLooseEqualityOp(jsop) || JSOp::isStrictEqualityOp(jsop)
+    }
+
+    fn isRelationalOp(jsop: JSOp) -> Bool {
+        jsop == JSOp::Lt || jsop == JSOp::Le || jsop == JSOp::Gt || jsop == JSOp::Ge
+    }
 }

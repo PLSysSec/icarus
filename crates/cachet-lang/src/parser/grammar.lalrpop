@@ -212,9 +212,12 @@ BlockInner: Block = {
 };
 
 
+// One entry in a block's statement list. The first alternative is the only thing
+// that may appear without a trailing semicolon, and being semicolon-less is what
+// requires it to be unit-typed.
 #[inline]
 BlockOrStmt: Spanned<Stmt> = {
-    <block:Spanned<KindedBlock>> => block.map(Stmt::from),
+    <expr:Spanned<BlockExpr>> => expr.map(Stmt::Expr),
     <stmt:Spanned<Stmt>> => stmt
 };
 
@@ -232,15 +235,16 @@ BlockKind: BlockKind = {
 Stmt: Stmt = {
     <let_stmt:LetStmt> ";"+ => let_stmt.into(),
     <label_stmt:LabelStmt> ";"+ => label_stmt.into(),
-    <if_stmt:IfStmt> => if_stmt.into(),
     <for_in_stmt:ForInStmt> => for_in_stmt.into(),
     <check_stmt:CheckStmt> ";"+ => check_stmt.into(),
     <goto_stmt:GotoStmt> ";"+ => goto_stmt.into(),
     <bind_stmt:BindStmt> ";"+ => bind_stmt.into(),
     <emit_stmt:EmitStmt> ";"+ => emit_stmt,
     <ret_stmt:RetStmt> ";"+ => ret_stmt.into(),
-    <expr:Expr<NoBlock>> ";"+ => expr.into(),
-    <expr:BlockExpr> ";"+ => expr.into(),
+    "unreachable" ";"+ => Stmt::Unreachable,
+    // With a semicolon, the value is discarded whatever its type.
+    <expr:Expr<NoBlock>> ";"+ => Stmt::Semi(expr),
+    <expr:BlockExpr> ";"+ => Stmt::Semi(expr),
 };
 
 LetStmt: LetStmt =
@@ -249,9 +253,9 @@ LetStmt: LetStmt =
 LabelStmt: LabelStmt =
     <label:Label> => LabelStmt { label };
 
-IfStmt: IfStmt =
+IfExpr: IfExpr =
     "if" <cond:Spanned<Expr<WithBlock>>> <then:Block> <else_:("else" <ElseClause>)?> =>
-        IfStmt { cond, then, else_ };
+        IfExpr { cond, then, else_ };
 
 ForInStmt: ForInStmt = 
     "for" <var:Spanned<Ident>> "in" <target:Spanned<Path>> <order:ForInOrder> <body:Block> =>
@@ -263,7 +267,7 @@ ForInOrder: ForInOrder = {
 }
 
 ElseClause: ElseClause = {
-    <else_if:Box<IfStmt>> => else_if.into(),
+    <else_if:Box<IfExpr>> => else_if.into(),
     <else_block:Block> => else_block.into(),
 }
 
@@ -297,9 +301,14 @@ WithBlock: PrecExpr = {
    BlockExpr => <>.into(),
 }
 
+// The expressions that can stand in statement position without a trailing
+// semicolon, because they are self-delimiting -- Rust's `ExpressionWithBlock`.
+// Restricting the no-semicolon form to these is what keeps `{ 1 1 }` a parse
+// error.
 #[inline]
 BlockExpr: Expr = {
    KindedBlock => Expr::from(<>),
+   IfExpr => Expr::from(<>),
 };
 
 PrecExpr<B>: B = {
