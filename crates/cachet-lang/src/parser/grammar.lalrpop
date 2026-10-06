@@ -175,7 +175,7 @@ Label: Label =
     "label" <ident:Spanned<Ident>> ":" <ir:Spanned<Path>> => Label { ident, ir };
 
 Arg: Arg = {
-    <expr:PrecExpr<NoBlock>> => {
+    <expr:PrecExpr<WithBlock>> => {
         match expr.expr {
             Expr::Var(path) if !expr.is_grouped => FreeArg { path, is_out: false }.into(),
             Expr::FieldAccess(field_access) if !expr.is_grouped => (*field_access).into(),
