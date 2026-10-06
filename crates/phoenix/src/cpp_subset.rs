@@ -169,6 +169,7 @@ pub enum Expr {
     Construct(Construct),
     Unary(UnaryOp),
     Binary(BinaryOp),
+    Ternary(TernaryOp),
     Ref(Ref),
     EnumConst(EnumConst),
     Lit(Lit),
@@ -236,6 +237,21 @@ pub struct BinaryOp {
     pub op: String,
     pub lhs: Box<TypedExpr>,
     pub rhs: Box<TypedExpr>,
+}
+
+/// `cond ? then : els`.
+///
+/// Kept as an expression rather than reshaped into a statement, because Cachet's
+/// `if` is an expression too, so the correspondence is direct and holds in every
+/// position -- an argument, a `let`'s initializer, a return value.
+///
+/// GNU's elided form `a ?: b` is a different node kind (`BinaryConditionalOperator`),
+/// so it is refused rather than silently read as this.
+#[derive(Clone, Debug)]
+pub struct TernaryOp {
+    pub cond: Box<TypedExpr>,
+    pub then: Box<TypedExpr>,
+    pub els: Box<TypedExpr>,
 }
 
 /// A name in expression position, resolved to what it refers to.
@@ -407,6 +423,11 @@ pub fn walk_expr<V: Visit + ?Sized>(v: &mut V, expr: &Expr) {
         Expr::Binary(b) => {
             v.visit_expr(&b.lhs.value);
             v.visit_expr(&b.rhs.value);
+        }
+        Expr::Ternary(t) => {
+            v.visit_expr(&t.cond.value);
+            v.visit_expr(&t.then.value);
+            v.visit_expr(&t.els.value);
         }
         Expr::Ref(r) => v.visit_ref(r),
         // Leaves.
@@ -1280,6 +1301,20 @@ fn extract_expr_value(e: Entity) -> Result<Expr> {
                 rhs: Box::new(extract_expr(*rhs)?),
             }))
         }
+        EntityKind::ConditionalOperator => {
+            let kids = e.get_children();
+            let [cond, then, els] = kids.as_slice() else {
+                return Err(Unsupported::Malformed {
+                    what: format!("conditional operator with {} operands", kids.len()),
+                    loc: loc(e),
+                });
+            };
+            Ok(Expr::Ternary(TernaryOp {
+                cond: Box::new(extract_expr(*cond)?),
+                then: Box::new(extract_expr(*then)?),
+                els: Box::new(extract_expr(*els)?),
+            }))
+        }
         EntityKind::IntegerLiteral
         | EntityKind::FloatingLiteral
         | EntityKind::StringLiteral
@@ -1916,6 +1951,12 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
             writeln!(f, "Binary `{}`", b.op)?;
             fmt_expr(f, &b.lhs.value, depth + 1)?;
             fmt_expr(f, &b.rhs.value, depth + 1)
+        }
+        Expr::Ternary(t) => {
+            writeln!(f, "Ternary")?;
+            fmt_labelled(f, "Cond", &t.cond.value, depth + 1)?;
+            fmt_labelled(f, "Then", &t.then.value, depth + 1)?;
+            fmt_labelled(f, "Else", &t.els.value, depth + 1)
         }
         Expr::Ref(r) => {
             let kind = match r.kind {

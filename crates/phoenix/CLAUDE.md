@@ -48,6 +48,12 @@ signature. phoenix does not, since it never reads the model. `to_arg` reproduces
 normalization, so the AST phoenix builds is the one the parser would have built, and
 nothing depends on the output being re-read.
 
+For the same reason, mind which expression statement you build. `Stmt::Semi(expr)`
+carries a trailing semicolon and discards the value; `Stmt::Expr(expr)` carries none,
+which the grammar permits only for a block or an `if`. A call wants `Semi` — without
+the semicolon it does not parse. The two hold the same payload, so a mix-up is invisible
+to the compiler and shows up as generated Cachet that `cachet-compiler` cannot read.
+
 Two failure vocabularies, and the messages say which:
 
 | | means | where |

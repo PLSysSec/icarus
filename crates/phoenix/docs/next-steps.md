@@ -1,7 +1,8 @@
-# Where `tryAttachInt32` stands, and what is left
+# Where `CompareIRGenerator` stands, and what is left
 
-Status: written 2026-10-01, updated 2026-10-02 when the first stub verified end to end.
-Measured by running the commands below, not from memory.
+Status: written 2026-10-01; updated 2026-10-02 when the first stub verified, and
+2026-10-06 after the `if`-expression work. Measured by running the command below, not
+from memory.
 
 ## Confirmed state
 
@@ -9,15 +10,65 @@ Measured by running the commands below, not from memory.
 ./scripts/translate-verify.sh CompareIRGenerator
 ```
 
-`CompareIRGenerator::tryAttachInt32` reports **`PASS … verified`**: phoenix says
-`complete, 12 elided`, `cachet-compiler` accepts it, and Corral says *"Program has no
-bugs."* The module holds, in order: imports, the ops' helpers (`JSOpToCondition`,
-`EmitStoreBoolean`), `ir CacheIROps` with the five ops it emits, the generator's helpers
-and wrappers, then `ir CompareIRGenerator`.
+**14 stubs: 2 verified, 10 partial, 2 broken.** `tryAttachInt32` and
+`tryAttachAnyNullUndefined` both report `PASS … verified` — phoenix translates them
+completely, `cachet-compiler` accepts them, and Corral says *"Program has no bugs."* 22
+phoenix tests pass.
 
-Across the class: **1 verified, 9 partial, 4 broken** — and every failure is now in
-*translation*, phoenix's own gaps. Nothing fails to compile or verify. 22 phoenix tests
-pass.
+A verified module holds, in order: imports, the ops' helpers (`JSOpToCondition`,
+`EmitStoreBoolean`), `ir CacheIROps` with the ops it emits, the generator's helpers and
+wrappers, then `ir CompareIRGenerator`.
+
+Nothing fails to compile or verify any more; every one of the 39 remaining gaps is in
+*translation*. The two `broken` stubs fail outright rather than partially, both on
+`LambdaExpr` (CacheIR.cpp:15134, :15156).
+
+## The blockers, by leverage
+
+Counting gaps across all 14 stubs. The first two groups are table rows against model ops
+that already exist, so they are the cheap ones.
+
+**Five masm rows would clear 13 gaps.** Each is a `branchTest*` on a `ValueOperand` in
+an `emitGuardTo*`, and the model has every op:
+
+| C++ | model op | gaps |
+|---|---|---|
+| `branchTestBigInt` (CacheIRCompiler.cpp:1948) | `BranchTestBigInt` | 4 |
+| `branchTestNumber` (:1777, :5419, :5420) | `BranchTestNumber` | 3 |
+| `branchTestString` (:1918) | `BranchTestString` | 2 |
+| `branchTestBoolean` (:1964) | `BranchTestBoolean` | 2 |
+| `branchTestSymbol` (:1933) | `BranchTestSymbol` | 1 |
+
+Key them on the operand shape, not `_`: each has a `*Tag` sibling, and
+`emitCompareNullUndefinedResult` already reaches both forms of three such methods. See
+`masm-op-overloads.md`.
+
+**Three `translate_method` rows would clear 3 gaps** — `isString`, `isObject`,
+`isSymbol` on a `Value`, all present in the model beside the `isBigInt` row added
+2026-10-02.
+
+**The rest, roughly by how often it recurs:**
+
+- **The statement-position ternary** (CacheIR.cpp:15112, :15114) — 2 gaps, and the only
+  thing between `tryAttachNullUndefined` and a complete translation. Needs the arms to
+  become blocks of *statements*; see `nonlocal-transformations.md`.
+- **`TypeAliasDecl`** in the three BigInt emitters (CacheIRCompiler.cpp:8894, :8974,
+  :9043) — 3 gaps. A `using` declaration inside a function body.
+- **`DoubleField` has no writer in the model**, and **no allocator for `NumberId`** — 4
+  gaps between them, blocking `tryAttachNumber` and `tryAttachBigIntNumber`. Both are
+  model gaps rather than translator gaps.
+- **`return emitComparePointerResultShared(..)`** — 2 gaps, refused as "an instruction
+  returning anything but `true`". The emitter delegates its whole body to a shared
+  helper.
+- **`AutoAvailableFloatRegister`** — 2 gaps, the float half of the `Auto*` family; see
+  `scope-end-effects.md`.
+- **`LambdaExpr`** — the 2 broken stubs. `tryAttachStringNumber` and
+  `tryAttachPrimitiveSymbol` pass a lambda to a helper.
+- **One-offs:** `masm.compareBigIntAndInt32` (the one needed masm op the model
+  *lacks*), `allocator.ensureDoubleRegister`, `emitLoadValueTag`'s `DeclRefExpr`,
+  `SameType`'s unreadable `IntegerLiteral` (Value.h:1270), and
+  `emitCompareStringResult` having no definition in `CacheIRCompiler.cpp` — it is a
+  per-backend emitter.
 
 ## How the divergence blocker was resolved
 
@@ -53,6 +104,43 @@ Things settled along the way, worth not re-deriving:
 - A reachable `unreachable` *does* fail verification — `tests/verifier/fail/unreachable.cachet`
   pins that, so the construct cannot be used as an escape hatch.
 
+## How the ternary blocker was resolved
+
+`?:` had no counterpart: Cachet's `if` was a statement, so there was nowhere for a
+conditional *expression* to go. The workaround that looks like it should work is a
+silent trap — `let foo = { if c { 1 } else { 2 } };` parses, type checks, and binds
+`foo` to **`Unit`**, the arms' values discarded without a word, because `IfStmt::type_`
+returned a hardcoded `Unit` instead of reading the arms.
+
+So `if` became an expression (2026-10-06, `a5ec277`), following Rust:
+
+| | |
+|---|---|
+| `Expr::If` | added; `Stmt::If` removed |
+| `Stmt::Block` | removed, generalized into `Stmt::Expr` |
+| `Stmt::Expr` | **no** trailing semicolon, must be unit-typed |
+| `Stmt::Semi` | **with** a semicolon, value discarded |
+| arms | must agree on a type, which discharges `// TODO(spinda)` at type_checker.rs:1271 |
+| an arm that diverges | contributes no type, so `if c { 1_i32 } else { unreachable; }` is an `Int32` |
+| normalizer | unused → `Stmt::If` as before; used → `let mut tmp; if c { tmp = a } else { tmp = b }; tmp` |
+
+`normalizer::Stmt::If` is unchanged, so the flattener and both backends were untouched.
+
+Three things that bit, worth not rediscovering:
+
+- **`Stmt::Expr` reversed meaning.** It used to be the semicolon form. Nine phoenix
+  sites constructing it silently became semicolon-less; the compiler cannot catch this,
+  since the variant name and payload type are identical. It surfaced as generated
+  Cachet that would not parse.
+- **`Stmt::Expr(Expr::Block(..))` printed `({ .. })`**, which is unparseable in
+  statement position — `Expr::Block`'s own `Display` parenthesizes, where the old
+  `Stmt::Block` held a `KindedBlock` and printed it bare. Fixed with an
+  `Unparenthesized` wrapper beside `MaybeGrouped`.
+- **A *trailing* `if` is the block's value, not a statement** — the grammar prefers that
+  reading, which is what makes `{ .. if c { 1 } else { 2 } }` produce a value. phoenix's
+  `walk_block` only iterated `stmts`, so `emitted_ops` found nothing in such a block.
+  Caught by an existing test.
+
 ## Smaller things, roughly by value
 
 - **4 elided `MOZ_ASSERT`s** remain in the output. Dropping an assertion is sound but
@@ -78,10 +166,10 @@ Things settled along the way, worth not re-deriving:
   kind from the `use*Id`/`define*Id` that bound it, which is enough for `move32`. It
   does not track an op *changing* a register's contents — `CastBoolToInt32` leaves an
   int32 where a bool was, and `scopes` still says bool.
-- **`masm_ops`' `_` shape rows don't discriminate.** `branchTestNull` is four C++
-  overloads against two model ops and every emitter so far passes the `ValueOperand`
-  one. `moveValue` and `movePtr` are keyed properly; the rest are right by luck of
-  which overload is reached.
+- **`masm_ops`' remaining `_` shape rows don't discriminate.** `branchTestInt32`,
+  `branch32` and `fallibleUnboxBoolean` are right only by luck of which overload is
+  reached. The `branchTestNull`/`Undefined`/`Object` rows were keyed 2026-10-02 when
+  one emitter needed both forms at once; see `masm-op-overloads.md`.
 - **`translate_label_ref` and `translate_failure_label` produce expressions**, with
   `to_arg` normalizing afterwards. Argument-level would be tighter, since neither is
   legal anywhere else. Fails loudly if misused, so not urgent.
@@ -122,8 +210,12 @@ Things settled along the way, worth not re-deriving:
   type* carries it in the type instead, and three things follow:
 
   - `let x = if c { 1_i32 } else { unreachable; }` gives `x: Int32` with no special
-    case — it is ordinary subtyping. The interim measure is an exemption in
-    `expect_expr_type` for an expression that exits early, which `!` would delete.
+    case — it is ordinary subtyping. The interim measure, landed 2026-10-06, is an
+    exemption in `expect_expr_type` for an expression that exits early, plus the
+    matching rule in `type_check_if_expr` and `IfExpr::type_`; `!` would delete all
+    three. Those last two must stay in step, and each says so — getting them out of
+    step is how `if c { unreachable; } else { 1_i32 }` would be rejected by the check
+    while `type_` claimed `Int32`.
   - It subsumes the way `unreachable` is encoded. It is a *statement* that sets
     `exits_early` so a value-returning body needs no trailing value; with `!` it would
     be an expression, and the trailing value would simply coerce. That is how Rust
@@ -159,7 +251,6 @@ Things settled along the way, worth not re-deriving:
 
 ## The other notes here
 
-`masm-op-overloads.md` (the operand column landed, the `_` rows remain) and
-`nonlocal-transformations.md` (the cases are implemented; it records why there is no
-second IR) are current. `scope-end-effects.md` was rewritten 2026-10-02 when the
-register half landed.
+All current as of 2026-10-06. `masm-op-overloads.md` was updated when the operand
+column widened to two positions; `nonlocal-transformations.md` when the ternary turned
+out to need two rules; `scope-end-effects.md` when the register half landed.

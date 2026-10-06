@@ -1,8 +1,7 @@
 # Transformations that aren't local name-to-name mappings
 
-Status: the three cases below are implemented; the conclusion against a second IR
-stands. Noted 2026-09-28, trimmed 2026-10-01 to keep the decision and drop the
-problem statement, which the code now answers.
+Status: the cases below are implemented bar the last; the conclusion against a second
+IR stands. Noted 2026-09-28, trimmed 2026-10-01, extended 2026-10-06 with the ternary.
 
 Most of the translator is tables — `translate_type`, `translate_method`,
 `translate_free`, `translate_enum_const`, `masm_ops` — each mapping one name to
@@ -17,7 +16,19 @@ that don't were handled as follows:
   overloading. Done as this note recommended — a local environment in `State`, not an
   adjacency match, so the construction and its use need not be neighbours and a
   non-literal tag is refused cleanly.
-- **Scope-end effects.** Half done; see `scope-end-effects.md`.
+- **Scope-end effects.** Done for failure paths and the register wrappers; see
+  `scope-end-effects.md`.
+- **The ternary operator**, which needs *two* rules rather than one, and not because of
+  position. `c ? a : b` maps directly onto `if c { a } else { b }` now that Cachet's
+  `if` is an expression -- `writer.loadBooleanResult(op_ == JSOp::StrictNe ? true :
+  false)` translates in argument position with no reshaping at all. But a `void` arm
+  has no expression form: `writer.guardIsNull(id)` becomes `emit CacheIROps::
+  GuardIsNull(id)`, and an `emit` is a *statement* in Cachet. So
+  `lhsVal_.isNull() ? writer.guardIsNull(lhsId) : writer.guardIsUndefined(lhsId);`
+  (CacheIR.cpp:15112) needs the arms to become blocks of statements instead, which is a
+  `translate_known_stmt` idiom. The split is along "do the arms produce values", which
+  is a fact about the *model* -- that emitting is a statement there -- rather than about
+  C++.
 
 ## Why there is no second IR
 

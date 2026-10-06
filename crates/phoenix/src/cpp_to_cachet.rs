@@ -1160,6 +1160,17 @@ fn translate_output_type(
     )))
 }
 
+/// A block whose only content is its value: `{ expr }`.
+///
+/// What a ternary's arms become. Cachet reads a block's trailing expression as its
+/// value, so this is how an expression is placed where a block is wanted.
+fn value_block(expr: Expr) -> Block {
+    Block {
+        stmts: Vec::new(),
+        value: Spanned::internal(Some(expr)),
+    }
+}
+
 /// `&ifTrue` is the label `ifTrue`.
 ///
 /// C++ passes a label by address because masm records patch sites in it; the model
@@ -1538,6 +1549,17 @@ fn translate_expr_value(
                 rhs: Spanned::internal(translate_expr(ctx, state, &binary.rhs)?),
             })))
         }
+
+        // `c ? a : b` is `if c { a } else { b }`, Cachet's `if` being an expression.
+        // One mapping covers every position the ternary can appear in, and the arms
+        // are blocks whose *value* is the branch -- no statements, nothing to hoist.
+        CppExpr::Ternary(t) => Ok(Expr::If(Box::new(CachetIfExpr {
+            cond: Spanned::internal(translate_expr(ctx, state, &t.cond)?),
+            then: value_block(translate_expr(ctx, state, &t.then)?),
+            else_: Some(ElseClause::Else(value_block(translate_expr(
+                ctx, state, &t.els,
+            )?))),
+        }))),
 
         CppExpr::Construct(c) => translate_retype(ctx, state, c),
         CppExpr::EnumConst(e) => {
