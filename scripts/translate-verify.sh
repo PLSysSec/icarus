@@ -132,18 +132,31 @@ for symbol in "${symbols[@]}"; do
     continue
   fi
 
-  # 3. Verify. Corral reports success in its output rather than its exit status.
+  # 3. Verify. Corral reports success in its output rather than its exit status,
+  #    and says "Program has no bugs" even when it checked nothing -- after
+  #    "Error: ProverException: Cannot find any prover executable", say. So its
+  #    output is kept apart from the earlier stages', and any `Error:` in it means
+  #    the verifier didn't run, whatever it concluded.
+  corral_out="${out_dir}/${name}.corral"
   timeout "${verify_timeout}" "${scripts_dir}/run-corral-mac.sh" "${bpl_file}" \
-    >> "${log}" 2>&1
+    > "${corral_out}" 2>&1
   status=$?
+  cat "${corral_out}" >> "${log}"
   if [[ ${status} -eq 124 ]]; then
     report VERIFY "${symbol}" "timed out after ${verify_timeout}s"
     unverified=$((unverified + 1))
     failed_names+=("${symbol}")
-  elif grep -q 'Program has no bugs' "${log}"; then
+  elif [[ ${status} -ne 0 ]] || grep -q '^Error' "${corral_out}" \
+      || ! grep -q 'Program has \(no bugs\|bugs\|a potential bug\)' "${corral_out}"; then
+    detail="$(grep -m1 '^Error' "${corral_out}" || tail -n1 "${corral_out}")"
+    report VERIFIER "${symbol}" "did not run: ${detail}"
+    unverified=$((unverified + 1))
+    failed_names+=("${symbol}")
+  elif grep -q 'Program has no bugs' "${corral_out}"; then
     report PASS "${symbol}" "verified"
     pass=$((pass + 1))
   else
+    # "Program has bugs" or "..a potential bug" (vendor/corral Driver.cs:613, :1119).
     # The counterexample is many lines of trace; the log is the place for it.
     report VERIFY "${symbol}" "counterexample -- see ${log#"${repo_dir}"/}"
     unverified=$((unverified + 1))

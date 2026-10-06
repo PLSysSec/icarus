@@ -28,7 +28,7 @@ use crate::cpp_subset::{
     TypedExpr as CppTypedExpr, get_fn_def, walk_block,
 };
 use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
-use crate::masm_ops::{LABEL, MACRO_ASSEMBLER, MASM, MasmStmt, is_masm, masm_call};
+use crate::masm_ops::{LABEL, MACRO_ASSEMBLER, MASM, MasmStmt, is_masm, is_masm_class, masm_call};
 use crate::names::{NameMap, declared_names};
 use crate::scopes::{Obligation, Scopes};
 
@@ -671,6 +671,14 @@ impl Ctx<'_> {
             .is_some_and(|class| class.scope == CACHE_IR_WRITER)
     }
 
+    /// Whether `this` is the machine, which makes a call on an implicit receiver --
+    /// `splitTag(value, scratch)` inside `extractTag` -- a masm call.
+    fn recv_is_masm(&self) -> bool {
+        self.class
+            .as_ref()
+            .is_some_and(|class| is_masm_class(&class.scope))
+    }
+
     /// Whether this is a stub generator, whose `AttachDecision` return is
     /// protocol with the dispatcher rather than a value.
     fn is_stub_generator(&self) -> bool {
@@ -826,6 +834,11 @@ fn translate_free(name: &str) -> Option<CachetPath> {
         // same thing abstractly: the result `isBool` and reads back as `b`
         // (notes/js.cachet:505).
         "BooleanValue" => ("Value", "fromBool"),
+        // `SameType(lhs, rhs)` compares tag bits, with a separate clause for doubles,
+        // which have no single tag (Value.h:1263). Same relation as the model's
+        // `typeOf(a) == typeOf(b)` (notes/js.cachet:441): `ValueType` has one variant
+        // per `JSValueType`, `Double` among them.
+        "SameType" => ("Value", "isSameType"),
         _ => return None,
     };
     Some(CachetPath::from_ident(ty).nest(Ident::from(f)))
@@ -1103,7 +1116,50 @@ fn translate_known_expr(
     if let Some(ty) = translate_output_type(ctx, state, expr)? {
         return Ok(Some(ty));
     }
+    if let Some(eq) = translate_register_eq(ctx, state, expr)? {
+        return Ok(Some(eq));
+    }
     Ok(None)
+}
+
+/// `tag == res` on two `Register`s is Cachet's built-in `==` on `Reg`.
+///
+/// `Register::operator==` compares register codes (Registers.h), which is identity,
+/// and the model compares `Reg`s directly (`tagReg != resultReg`,
+/// notes/cacheir.cachet:1128). Other types' `operator==` stay unhandled: an overload
+/// can mean anything, so reading it as built-in equality is the silent kind of
+/// mistake.
+fn translate_register_eq(
+    ctx: &Ctx<'_>,
+    state: &mut State,
+    expr: &CppTypedExpr,
+) -> Result<Option<Expr>, Unhandled> {
+    let CppExpr::Call(call) = &expr.value else {
+        return Ok(None);
+    };
+    let CppCallee::Method {
+        recv: Some(recv),
+        callee,
+    } = &call.callee
+    else {
+        return Ok(None);
+    };
+    let [rhs] = call.args.as_slice() else {
+        return Ok(None);
+    };
+    if callee.name != "operator=="
+        || !recv
+            .ty
+            .as_ref()
+            .is_some_and(|ty| ty.scope == ["js", "jit", "Register"])
+    {
+        return Ok(None);
+    }
+    Ok(Some(Expr::BinOper(Box::new(BinOperExpr {
+        oper: Spanned::internal(BinOper::Compare(CompareBinOper::Eq)),
+        lhs: Spanned::internal(translate_expr(ctx, state, recv)?),
+        rhs: Spanned::internal(translate_expr(ctx, state, rhs)?),
+    }))))
 }
 
 /// `output.type()` is two calls in the model.
@@ -1483,10 +1539,22 @@ fn translate_expr_value(
                 callee,
             } => {
                 let recv_ty = expr_type(recv)?;
-                let (ty, name) = translate_method(recv_ty, &callee.name).ok_or_else(|| {
-                    Unhandled::new(format!("method `{}` on `{}`", callee.name, recv_ty.spelled))
-                })?;
-                let target = CachetPath::from_ident(ty).nest(Ident::from(name));
+                let target = match translate_method(recv_ty, &callee.name) {
+                    Some((ty, name)) => CachetPath::from_ident(ty).nest(Ident::from(name)),
+                    // A masm method used as a value -- `masm.extractTag(val, res)` --
+                    // is translated from its definition, as a `custom_writer` method
+                    // is. In statement position masm calls are `masm_ops`' instead.
+                    None if is_masm(recv_ty) => {
+                        state.needed.push(Needed::Cpp(callee.clone()));
+                        CachetPath::from_ident(Ident::from(callee.name.clone()))
+                    }
+                    None => {
+                        return Err(Unhandled::new(format!(
+                            "method `{}` on `{}`",
+                            callee.name, recv_ty.spelled
+                        )));
+                    }
+                };
 
                 // A value receiver leads, as `impl Value { fn isNumber(value:
                 // Value) }` takes its subject as the first argument. An ambient
@@ -1988,10 +2056,10 @@ fn translate_known_stmt(
         CppStmt::Expr(CppTypedExpr {
             value: CppExpr::Call(_),
             ..
-        }) if masm_call(&stmt.value, &state.scopes).is_some() => {
+        }) if masm_call(&stmt.value, &state.scopes, ctx.recv_is_masm()).is_some() => {
             // One call can mean several statements, so this is a loop: see
             // `masm_call`.
-            let masm_stmts = masm_call(&stmt.value, &state.scopes).unwrap();
+            let masm_stmts = masm_call(&stmt.value, &state.scopes, ctx.recv_is_masm()).unwrap();
             let mut stmts = Vec::new();
             for masm_stmt in masm_stmts {
                 stmts.push(Spanned::internal(match masm_stmt {
@@ -2425,7 +2493,7 @@ pub fn translate_fn_def(
     let emits = if ctx.recv_is_writer() || takes(is_writer) {
         // Taking the writer means emitting ops, so it follows wherever they are.
         Some(op_ir.path())
-    } else if takes(is_masm) {
+    } else if ctx.recv_is_masm() || takes(is_masm) {
         Some(CachetPath::from_ident("MASM"))
     } else {
         None
@@ -2754,8 +2822,10 @@ pub fn load_ops() -> Result<Ops, Error> {
 /// A method is accepted only where its class makes it a helper. A
 /// `CacheIRWriter` wrapper qualifies: it reads no writer state, only its
 /// parameters and the op behind it, so nothing is lost by dropping the receiver.
-/// A method on any other class carries state or ambient entities that a
-/// top-level `fn` cannot, and needs a unit of its own.
+/// A masm method qualifies the same way, its receiver being the ambient machine:
+/// `extractTag` is two masm calls and a return. A method on any other class
+/// carries state or ambient entities that a top-level `fn` cannot, and needs a
+/// unit of its own.
 fn extract_helper<'tu>(entity: &Entity<'tu>) -> Result<(Option<ClassRef>, FnDef<'tu>), Error> {
     match entity.get_kind() {
         EntityKind::Method => {
@@ -2763,9 +2833,9 @@ fn extract_helper<'tu>(entity: &Entity<'tu>) -> Result<(Option<ClassRef>, FnDef<
             // The class comes along, because what it makes ambient is exactly
             // what a bare `FnDef` would have lost: inside a wrapper, `this` is
             // the writer, so `guardToInt32_(input)` is a writer call.
-            if method.class.scope != CACHE_IR_WRITER {
+            if method.class.scope != CACHE_IR_WRITER && !is_masm_class(&method.class.scope) {
                 return Err(Unhandled::new(format!(
-                    "`{}::{}`: a method on a class other than CacheIRWriter",
+                    "`{}::{}`: a method on a class other than CacheIRWriter or masm",
                     method.class, method.def.name.name
                 ))
                 .into());

@@ -7,11 +7,11 @@
 //! `notes/masm.cachet` says it means, and this file is the correspondence
 //! between the two.
 //!
-//! One simplification falls out of that: masm methods return nothing (1385 of
-//! 1527 declarations in `MacroAssembler.h` are `void`, and the rest are wasm
-//! trap ranges and patchable-jump offsets, which no stub emitter calls). So a
-//! masm call is always a statement, and there is no counterpart to the
-//! result-bearing CacheIR ops that need a synthesized wrapper.
+//! Nearly every masm method returns nothing (1385 of 1527 declarations in
+//! `MacroAssembler.h` are `void`), so a masm call is nearly always a statement,
+//! and those are what this table maps. The exceptions a stub emitter calls, such
+//! as `extractTag`, return a register: their definitions are translated as helpers
+//! instead, the way a `custom_writer` CacheIR method is.
 
 use cachet_lang::ast::Path as CachetPath;
 
@@ -32,6 +32,23 @@ pub const MACRO_ASSEMBLER: [&str; 3] = ["js", "jit", "MacroAssembler"];
 
 pub fn is_masm(ty: &CppType) -> bool {
     ty.scope == MASM || ty.scope == MACRO_ASSEMBLER
+}
+
+/// The classes whose methods run with `this` as the machine: `MacroAssembler` and
+/// the platform bases it inherits from on x64, where most of the methods a stub
+/// calls are declared (`extractTag` is `MacroAssemblerX64`'s, :978).
+///
+/// x64 only, as is the translation unit: arm64's bases are other classes, with
+/// other definitions (its `extractTag` calls `splitSignExtTag`).
+const MASM_FAMILY: [[&str; 3]; 4] = [
+    MASM,
+    MACRO_ASSEMBLER,
+    ["js", "jit", "MacroAssemblerX64"],
+    ["js", "jit", "MacroAssemblerX86Shared"],
+];
+
+pub fn is_masm_class(scope: &[String]) -> bool {
+    MASM_FAMILY.iter().any(|class| scope == class)
 }
 
 /// `js::jit::Label`, a position in the code being emitted. Masm's own type, and
@@ -69,7 +86,14 @@ pub enum MasmStmt<'e> {
 /// `None` where the statement isn't a masm call at all, and where it is one the
 /// model has no op for -- the two are told apart by the error the caller reports,
 /// not here.
-pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<MasmStmt<'e>>> {
+///
+/// `this_is_masm` says an implicit `this` is the machine, as inside a masm helper,
+/// where `splitTag(value, scratch)` is `masm.splitTag(value, scratch)`.
+pub fn masm_call<'e>(
+    stmt: &'e CppStmt,
+    scopes: &Scopes,
+    this_is_masm: bool,
+) -> Option<Vec<MasmStmt<'e>>> {
     let CppStmt::Expr(CppTypedExpr {
         value: CppExpr::Call(call),
         ..
@@ -77,14 +101,14 @@ pub fn masm_call<'e>(stmt: &'e CppStmt, scopes: &Scopes) -> Option<Vec<MasmStmt<
     else {
         return None;
     };
-    let CppCallee::Method {
-        recv: Some(recv),
-        callee,
-    } = &call.callee
-    else {
+    let CppCallee::Method { recv, callee } = &call.callee else {
         return None;
     };
-    if !matches!(&recv.value, CppExpr::Ref(r) if is_masm(&r.ty)) {
+    let on_masm = match recv {
+        Some(recv) => matches!(&recv.value, CppExpr::Ref(r) if is_masm(&r.ty)),
+        None => this_is_masm,
+    };
+    if !on_masm {
         return None;
     }
 
@@ -222,9 +246,17 @@ fn translate_op(method: &str, args: &[CppTypedExpr]) -> Option<&'static str> {
         ("branchTestUndefined", _, Some("Reg")) => "BranchTestUndefinedTag",
         ("branchTestObject", _, Some("ValueReg")) => "BranchTestObject",
         ("branchTestObject", _, Some("Reg")) => "BranchTestObjectTag",
+        // Two overloads only, both modelled (MacroAssembler.h:1966, :2012): a number
+        // is either of two tags, so there is no single-word memory test to offer.
+        ("branchTestNumber", _, Some("ValueReg")) => "BranchTestNumber",
+        ("branchTestNumber", _, Some("Reg")) => "BranchTestNumberTag",
         // Extracts a `Value`'s type tag into a register (notes/masm.cachet:2161).
         // One signature, `(const ValueOperand&, ScratchTagScope&)`.
         ("splitTagForTest", _, _) => "SplitTagForTest",
+        // The same extraction into a plain register, reached from inside the
+        // `extractTag` helper (MacroAssembler-x64.h:715). Keyed: the `Register` and
+        // `Operand` sources (:709, :718) are raw bits, which the model has no op for.
+        ("splitTag", Some("ValueReg"), _) => "SplitTagForTest",
         // Keyed because the model has only the `ValueOperand` source
         // (notes/masm.cachet:1022) of four overloads -- the others take a `Register`,
         // an `Address` or a `BaseIndex` (MacroAssembler-arm64.h:1447-1457).

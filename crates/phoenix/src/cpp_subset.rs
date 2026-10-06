@@ -1274,10 +1274,20 @@ fn extract_expr_value(e: Entity) -> Result<Expr> {
                         what: String::from("unary operator without operand"),
                         loc: loc(e),
                     })?;
-            let op = operator_spelling(e).ok_or_else(|| Unsupported::Malformed {
+            let mut op = operator_spelling(e).ok_or_else(|| Unsupported::Malformed {
                 what: String::from("unary operator with no readable spelling"),
                 loc: loc(e),
             })?;
+            // C++20 rewrites `a != b` with only an `operator==` to `!(a == b)`. The
+            // `!` is synthesized, so the token at its location is the `!=` it
+            // replaced; no other rewrite yields a `UnaryOperator`.
+            //
+            // LIBCLANG: a hack around the missing spelling. clang's own AST gives the
+            // opcode (`UO_LNot`) and marks the rewrite (`CXXRewrittenBinaryOperator`),
+            // so reading the full tree would need neither the token nor this fixup.
+            if op == "!=" {
+                op = String::from("!");
+            }
             Ok(Expr::Unary(UnaryOp {
                 op,
                 operand: Box::new(extract_expr(operand)?),
@@ -1448,6 +1458,9 @@ fn extract_call(e: Entity) -> Result<Call> {
     };
 
     let kids = e.get_children();
+    if let Some(operands) = operator_operands(target, &kids) {
+        return extract_operator_call(e, target, fn_ref, &operands);
+    }
     let (callee_expr, args) = kids.split_first().ok_or_else(|| Unsupported::Malformed {
         what: format!("call to {name} with no callee"),
         loc: loc(e),
@@ -1478,6 +1491,67 @@ fn extract_call(e: Entity) -> Result<Call> {
         .map(extract_expr)
         .collect::<Result<Vec<_>>>()?;
     Ok(Call { callee, args })
+}
+
+/// The operands of an overloaded-operator call, or `None` for any other call.
+///
+/// LIBCLANG: an operator call lists its children in source order, so the callee
+/// sits among the operands -- `tag == res` is `[tag, operator==, res]` -- and is a
+/// `DeclRefExpr` even for a member operator. An explicit `a.operator==(b)` is an
+/// ordinary method call, its callee a leading `MemberRefExpr`.
+///
+/// The callee is the child referring to the target. A `CallExpr` child refers to
+/// its own target, which is this one in `(a + b) + c`, so it is never the callee.
+fn operator_operands<'tu>(target: Entity<'tu>, kids: &[Entity<'tu>]) -> Option<Vec<Entity<'tu>>> {
+    let rest = target.get_name()?.strip_prefix("operator")?.to_owned();
+    // `operatorKind` is an identifier, not an operator.
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let at = kids.iter().position(|k| {
+        k.get_kind() != EntityKind::CallExpr && k.get_reference() == Some(target)
+    })?;
+    if kids[at].get_kind() == EntityKind::MemberRefExpr {
+        return None;
+    }
+    let mut operands = kids.to_vec();
+    operands.remove(at);
+    Some(operands)
+}
+
+/// `tag == res` as what clang resolved it to: `tag.operator==(res)` for a member
+/// operator, `operator==(tag, res)` for a free one. What the operator *means* is
+/// left to the translator.
+fn extract_operator_call(
+    e: Entity,
+    target: Entity,
+    fn_ref: FnRef,
+    operands: &[Entity],
+) -> Result<Call> {
+    let extract_all = |es: &[Entity]| es.iter().copied().map(extract_expr).collect::<Result<Vec<_>>>();
+    match target.get_kind() {
+        EntityKind::FunctionDecl | EntityKind::FunctionTemplate => Ok(Call {
+            callee: Callee::Free(fn_ref),
+            args: extract_all(operands)?,
+        }),
+        EntityKind::Method => {
+            let (recv, args) = operands.split_first().ok_or_else(|| Unsupported::Malformed {
+                what: format!("member {} with no operand", fn_ref.name),
+                loc: loc(e),
+            })?;
+            Ok(Call {
+                callee: Callee::Method {
+                    recv: Some(Box::new(extract_expr(*recv)?)),
+                    callee: fn_ref,
+                },
+                args: extract_all(args)?,
+            })
+        }
+        _ => Err(Unsupported::Callee {
+            name: fn_ref.name,
+            loc: loc(e),
+        }),
+    }
 }
 
 /// Whether a declaration sits inside a function or method body.
