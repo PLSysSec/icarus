@@ -484,18 +484,10 @@ impl From<Block> for KindedBlock {
 pub enum Stmt {
     #[from]
     Comment(Comment),
-    /// Represents a freestanding block in the statement position, *without*
-    /// a trailing semicolon. Requires that the block be unit-typed. A trailing
-    /// semicolon should cause the block to be parsed as an expression
-    /// statement, which ignores the type.
-    #[from(types(Block))]
-    Block(KindedBlock),
     #[from]
     Let(LetStmt),
     #[from]
     Label(LabelStmt),
-    #[from]
-    If(IfStmt),
     #[from]
     ForIn(ForInStmt),
     #[from]
@@ -510,9 +502,16 @@ pub enum Stmt {
     Ret(RetStmt),
     #[display(fmt = "unreachable;")]
     Unreachable,
-    #[display(fmt = "{_0};")]
-    #[from]
+    /// An expression in statement position with **no** trailing semicolon, which
+    /// requires it to be unit-typed. Only the expressions that can stand alone
+    /// without one get here -- a block or an `if`, the grammar's `BlockExpr` -- so
+    /// `{ 1 1 }` stays a parse error.
+    #[display(fmt = "{}", "Unparenthesized(_0)")]
     Expr(Expr),
+    /// An expression in statement position **with** a trailing semicolon, which
+    /// discards its value whatever the type.
+    #[display(fmt = "{_0};")]
+    Semi(Expr),
 }
 
 #[derive(Clone, Debug, Display)]
@@ -538,13 +537,13 @@ pub struct ForInStmt {
 }
 
 #[derive(Clone, Debug)]
-pub struct IfStmt {
+pub struct IfExpr {
     pub cond: Spanned<Expr>,
     pub then: Block,
     pub else_: Option<ElseClause>,
 }
 
-impl Display for IfStmt {
+impl Display for IfExpr {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "if {} {}", self.cond, self.then)?;
         if let Some(else_) = &self.else_ {
@@ -558,12 +557,12 @@ impl Display for IfStmt {
 #[display(fmt = "else {}")]
 pub enum ElseClause {
     #[from]
-    ElseIf(Box<IfStmt>),
+    ElseIf(Box<IfExpr>),
     #[from]
     Else(Block),
 }
 
-box_from!(IfStmt => ElseClause);
+box_from!(IfExpr => ElseClause);
 
 #[derive(Clone, Debug, Display)]
 #[display(fmt = "{kind} {cond};")]
@@ -605,6 +604,8 @@ pub enum Expr {
     #[from]
     Block(Box<KindedBlock>),
     #[from]
+    If(Box<IfExpr>),
+    #[from]
     Literal(Literal),
     #[from]
     Var(Spanned<Path>),
@@ -622,6 +623,7 @@ pub enum Expr {
 }
 
 box_from!(KindedBlock => Expr);
+box_from!(IfExpr => Expr);
 box_from!(NegateExpr => Expr);
 box_from!(FieldAccess => Expr);
 box_from!(CastExpr => Expr);
@@ -752,12 +754,31 @@ impl<T: Display> Display for CommaTerminated<'_, T> {
     }
 }
 
+/// An expression in statement position with no trailing semicolon, which the grammar
+/// admits only for a block or an `if`.
+///
+/// Those have to print *bare*: `Expr::Block`'s own `Display` parenthesizes, which is
+/// harmless in operand position but makes `({ .. })` as a statement unparseable --
+/// `BlockOrStmt` takes a `BlockExpr`, not a grouped expression.
+struct Unparenthesized<'a>(&'a Expr);
+
+impl Display for Unparenthesized<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self.0 {
+            Expr::Block(kinded_block) => Display::fmt(kinded_block, f),
+            expr => Display::fmt(expr, f),
+        }
+    }
+}
+
 struct MaybeGrouped<'a>(&'a Expr);
 
 impl Display for MaybeGrouped<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         let needs_group = match self.0 {
+            // An `if` is self-delimiting, like a block: its arms are braced.
             Expr::Block(_)
+            | Expr::If(_)
             | Expr::Literal(_)
             | Expr::Var(_)
             | Expr::Invoke(_)

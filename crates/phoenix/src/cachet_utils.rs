@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use cachet_lang::ast::{Ident, Path as CachetPath, Spanned};
-use cachet_lang::parser::{Arg, Block, Call, ElseClause, Expr, FreeArg, IfStmt, Item, Stmt};
+use cachet_lang::parser::{Arg, Block, Call, ElseClause, Expr, FreeArg, IfExpr, Item, Stmt};
 
 /// An argument, normalized as the parser normalizes one.
 ///
@@ -45,12 +45,15 @@ pub trait Visit {
     fn visit_stmt(&mut self, stmt: &Stmt) {
         walk_stmt(self, stmt);
     }
-    fn visit_if(&mut self, s: &IfStmt) {
+    fn visit_if(&mut self, s: &IfExpr) {
         walk_if(self, s);
     }
-    /// A leaf, so the default does nothing rather than descending. Expressions are
-    /// not walked at all yet -- nothing has needed one, and an `emit` is a statement,
-    /// so none hides in an expression.
+    /// Walked because a block and an `if` are *expressions*, so an `emit` does hide
+    /// in one: `if c { emit Foo(); }` is an expression statement.
+    fn visit_expr(&mut self, expr: &Expr) {
+        walk_expr(self, expr);
+    }
+    /// A leaf, so the default does nothing rather than descending.
     fn visit_emit(&mut self, _call: &Call) {}
 }
 
@@ -87,16 +90,22 @@ pub fn walk_block<V: Visit + ?Sized>(v: &mut V, block: &Block) {
     for stmt in &block.stmts {
         v.visit_stmt(&stmt.value);
     }
+    // A trailing block or `if` is the block's *value* rather than a statement -- the
+    // grammar prefers that reading, which is what lets `{ .. if c { 1 } else { 2 } }`
+    // produce a value. Walking the statements alone would miss whatever it contains.
+    if let Some(value) = &block.value.value {
+        v.visit_expr(value);
+    }
 }
 
 pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
     match stmt {
         Stmt::Emit(call) => v.visit_emit(call),
-        Stmt::Block(b) => v.visit_block(&b.block),
-        Stmt::If(s) => v.visit_if(s),
         Stmt::ForIn(s) => v.visit_block(&s.body),
+        // Where a block or an `if` lives, with or without a trailing semicolon.
+        Stmt::Expr(expr) | Stmt::Semi(expr) => v.visit_expr(expr),
         // No statements inside. A `let`'s initializer and a `check`'s condition are
-        // expressions, and `emit` is a statement, so none can hide in one.
+        // expressions, which could in principle hold a block -- see [`walk_expr`].
         Stmt::Comment(_)
         | Stmt::Let(_)
         | Stmt::Label(_)
@@ -104,12 +113,31 @@ pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
         | Stmt::Goto(_)
         | Stmt::Bind(_)
         | Stmt::Ret(_)
-        | Stmt::Unreachable
-        | Stmt::Expr(_) => {}
+        | Stmt::Unreachable => {}
     }
 }
 
-pub fn walk_if<V: Visit + ?Sized>(v: &mut V, s: &IfStmt) {
+pub fn walk_expr<V: Visit + ?Sized>(v: &mut V, expr: &Expr) {
+    match expr {
+        // The two that hold statements, which is where an `emit` can be.
+        Expr::Block(b) => v.visit_block(&b.block),
+        Expr::If(s) => v.visit_if(s),
+        // Hold expressions rather than statements. A block nested inside one --
+        // `f({ emit Foo(); 1 })` -- would be missed, which no generated module
+        // produces: phoenix emits only in statement position. Listed rather than
+        // wildcarded so a new variant has to be considered here.
+        Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::Invoke(_)
+        | Expr::FieldAccess(_)
+        | Expr::Negate(_)
+        | Expr::Cast(_)
+        | Expr::BinOper(_)
+        | Expr::Assign(_) => {}
+    }
+}
+
+pub fn walk_if<V: Visit + ?Sized>(v: &mut V, s: &IfExpr) {
     v.visit_block(&s.then);
     match &s.else_ {
         Some(ElseClause::ElseIf(s)) => v.visit_if(s),

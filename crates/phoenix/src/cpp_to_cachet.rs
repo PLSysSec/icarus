@@ -8,7 +8,7 @@ use cachet_lang::ast::{
 use cachet_lang::ast::{CheckKind, NegateKind};
 use cachet_lang::parser::{
     BinOperExpr, BindStmt, Block, Call, CallableItem, CheckStmt, Comment, ElseClause, Expr,
-    FieldAccess, GlobalVarItem, IfStmt as CachetIfStmt, ImportItem, IrItem, Item,
+    FieldAccess, GlobalVarItem, IfExpr as CachetIfExpr, ImportItem, IrItem, Item,
     Label as CachetLabel, LabelStmt, LetStmt, Literal, LocalVar, Mod, NegateExpr, RetStmt, Stmt,
 };
 use clang::{Entity, EntityKind};
@@ -481,7 +481,7 @@ fn translate_preamble(
         )));
     }
 
-    let mut stmts = vec![Spanned::internal(Stmt::Expr(invoke(
+    let mut stmts = vec![Spanned::internal(Stmt::Semi(invoke(
         CachetPath::from_ident("initRegState"),
     )))];
 
@@ -499,7 +499,7 @@ fn translate_preamble(
         }))
     }));
 
-    stmts.push(Spanned::internal(Stmt::Expr(invoke(
+    stmts.push(Spanned::internal(Stmt::Semi(invoke(
         CachetPath::from_ident("initValueOutput"),
     ))));
 
@@ -1628,9 +1628,12 @@ fn translate_stmt_values(
             })));
             Ok(stmts)
         }
-        CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(translate_if(
-            ctx, state, s,
-        )?))]),
+        // Statement position, so `Stmt::Expr` rather than `Stmt::Semi`: an `if` needs
+        // no trailing semicolon, and being without one requires it to be unit-typed,
+        // which every `if` translated from C++ control flow is.
+        CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::Expr(Expr::If(Box::new(
+            translate_if(ctx, state, s)?,
+        ))))]),
         // Cachet has no switch, so each case becomes a rung of an `else if` chain
         // testing the scrutinee against every value sharing that case's body, and
         // `default:` becomes the final `else`.
@@ -1657,7 +1660,7 @@ fn translate_stmt_values(
 
             let mut else_ = default.map(ElseClause::Else);
             for (cond, then) in arms.into_iter().rev() {
-                else_ = Some(ElseClause::ElseIf(Box::new(CachetIfStmt {
+                else_ = Some(ElseClause::ElseIf(Box::new(CachetIfExpr {
                     cond: Spanned::internal(cond),
                     then,
                     else_,
@@ -1665,7 +1668,9 @@ fn translate_stmt_values(
             }
             // The outermost rung is nobody's else clause, so it comes back out.
             Ok(match else_ {
-                Some(ElseClause::ElseIf(if_stmt)) => vec![Spanned::internal(Stmt::If(*if_stmt))],
+                Some(ElseClause::ElseIf(if_expr)) => {
+                    vec![Spanned::internal(Stmt::Expr(Expr::If(if_expr)))]
+                }
                 // A `default:` and no cases at all.
                 Some(ElseClause::Else(block)) => block.stmts,
                 None => Vec::new(),
@@ -1674,9 +1679,9 @@ fn translate_stmt_values(
         // A freestanding block, which Cachet has too. `translate_block` pushes a
         // scope, so what the block's declarations owe is discharged at its closing
         // brace rather than the enclosing one.
-        CppStmt::Block(body) => Ok(vec![Spanned::internal(Stmt::from(translate_block(
-            ctx, state, body,
-        )?))]),
+        CppStmt::Block(body) => Ok(vec![Spanned::internal(Stmt::Expr(Expr::Block(Box::new(
+            translate_block(ctx, state, body)?.into(),
+        ))))]),
         // `MOZ_CRASH("..")` says control never reaches here, which is exactly
         // `unreachable`. The reason string has no counterpart, so it is kept as a
         // comment.
@@ -1721,7 +1726,7 @@ fn translate_stmt_values(
             if matches!(&e.value, CppExpr::Call(call)
                 if matches!(call.callee, CppCallee::Free(_))) =>
         {
-            Ok(vec![Spanned::internal(Stmt::Expr(translate_expr(
+            Ok(vec![Spanned::internal(Stmt::Semi(translate_expr(
                 ctx, state, e,
             )?))])
         }
@@ -1859,7 +1864,7 @@ fn translate_known_stmt(
         // again, the construction itself being the effect.
         CppStmt::Let(l) if is_tag_scope_release_decl(l) => {
             state.scopes.lend_tag_scope();
-            vec![Spanned::internal(Stmt::Expr(invoke(
+            vec![Spanned::internal(Stmt::Semi(invoke(
                 CachetPath::from_ident("CacheIR").nest(Ident::from("releaseScratchReg")),
             )))]
         }
@@ -1929,7 +1934,7 @@ fn translate_known_stmt(
             let loader = field_loader(ty)
                 .ok_or_else(|| Unhandled::new(format!("no loader for a `{ty}` in the model")))?;
 
-            vec![Spanned::internal(Stmt::Expr(Expr::Invoke(Call {
+            vec![Spanned::internal(Stmt::Semi(Expr::Invoke(Call {
                 target: Spanned::internal(
                     CachetPath::from_ident("CacheIR").nest(Ident::from(loader.to_owned())),
                 ),
@@ -2053,7 +2058,7 @@ fn translate_if(
     ctx: &Ctx<'_>,
     state: &mut State,
     s: &CppIfStmt,
-) -> Result<CachetIfStmt, Unhandled> {
+) -> Result<CachetIfExpr, Unhandled> {
     let cond = Spanned::internal(translate_expr(ctx, state, &s.cond)?);
     let then = translate_block(ctx, state, &s.then)?;
     let else_ = match &s.els {
@@ -2068,7 +2073,7 @@ fn translate_if(
             _ => Some(ElseClause::Else(translate_block(ctx, state, els)?)),
         },
     };
-    Ok(CachetIfStmt { cond, then, else_ })
+    Ok(CachetIfExpr { cond, then, else_ })
 }
 
 /// `scrutinee == v1 || scrutinee == v2 || ..`: one switch case's test, over every
@@ -2297,20 +2302,20 @@ fn discharge(obligations: Vec<Obligation>) -> Vec<Spanned<Stmt>> {
     obligations
         .into_iter()
         .map(|obligation| match obligation {
-            Obligation::ReleaseFailurePath => Spanned::internal(Stmt::Expr(invoke(
+            Obligation::ReleaseFailurePath => Spanned::internal(Stmt::Semi(invoke(
                 CachetPath::from_ident("CacheIR").nest(Ident::from("releaseFailurePath")),
             ))),
-            Obligation::ReleaseScratchReg => Spanned::internal(Stmt::Expr(invoke(
+            Obligation::ReleaseScratchReg => Spanned::internal(Stmt::Semi(invoke(
                 CachetPath::from_ident("CacheIR").nest(Ident::from("releaseScratchReg")),
             ))),
             // Takes the tag register back. The register it returns is discarded, an
             // expression statement being unit-typed whatever its expression's type
             // (type_checker/ast.rs) -- which is how the model writes it too
             // (notes/cacheir.cachet:1424).
-            Obligation::ReacquireScratchReg => Spanned::internal(Stmt::Expr(invoke(
+            Obligation::ReacquireScratchReg => Spanned::internal(Stmt::Semi(invoke(
                 CachetPath::from_ident("CacheIR").nest(Ident::from("allocateScratchReg")),
             ))),
-            Obligation::ReleaseReg(reg) => Spanned::internal(Stmt::Expr(Expr::Invoke(Call {
+            Obligation::ReleaseReg(reg) => Spanned::internal(Stmt::Semi(Expr::Invoke(Call {
                 target: Spanned::internal(
                     CachetPath::from_ident("CacheIR").nest(Ident::from("releaseReg")),
                 ),

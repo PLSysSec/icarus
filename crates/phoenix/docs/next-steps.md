@@ -113,10 +113,41 @@ Things settled along the way, worth not re-deriving:
   `ScratchTagScopeRelease` — which lends the tag register out for an inner block and
   takes it back — is a *no-op* on 32-bit, so a translation that drops it is right there
   and wrong here.
-- **`ScratchTagScope` and `ScratchTagScopeRelease` are not translated.** The two scratch
-  wrappers are (see below); these are the rest of `emitCompareNullUndefinedResult`.
-  `ScratchTagScopeRelease` is the awkward one: it releases on *construction* and
-  re-acquires on destruction, so its scope-end obligation is the inverse of the others'.
+- **A bottom type (`!`) for Cachet, to replace `Block::exits_early`.** Deferred
+  2026-10-05 after being costed; recorded because it is a replacement rather than an
+  addition, which is easy to forget.
+
+  An expression that never produces a value has no type today, so the fact is carried
+  beside the type as `Block::exits_early: bool`. A `!` that is a *subtype of every
+  type* carries it in the type instead, and three things follow:
+
+  - `let x = if c { 1_i32 } else { unreachable; }` gives `x: Int32` with no special
+    case — it is ordinary subtyping. The interim measure is an exemption in
+    `expect_expr_type` for an expression that exits early, which `!` would delete.
+  - It subsumes the way `unreachable` is encoded. It is a *statement* that sets
+    `exits_early` so a value-returning body needs no trailing value; with `!` it would
+    be an expression, and the trailing value would simply coerce. That is how Rust
+    types `panic!`.
+  - `return` could become an expression, as in Rust, where `return e` is `!`. Today it
+    is statement-only, which is why `{ return "hi" }` does not parse without a `;`.
+
+  What it replaces, measured: the `exits_early` field (type_checker/ast.rs:299) and both
+  its consumers — the body's return-type check (type_checker.rs:322) and the
+  normalizer's implicit trailing return (normalizer.rs:153-162). The four producers
+  (`does_stmt_exit_early` and friends) stay, rebadged as the rule computing a block's
+  type. It does **not** subsume `flow.rs`'s `trace_body` assertion, which reads the
+  lowered statement structure and asks a different question.
+
+  What makes it tractable: `!` is uninhabited, so neither backend has a type to emit
+  for it. Allow it on expressions and in coercion but **refuse a local or parameter
+  typed `!`**, and a backend never sees one. Rust permits them and leans on MIR to drop
+  the dead code; nothing here needs them, and refusing turns
+  `let x = if c { return 1; } else { return 2; };` into a clean error rather than a
+  silent `Unit`.
+
+  Cost: a `BuiltInType` variant against 93 `BuiltInType::` references to audit, a
+  subtyping rule in `is_same_type`/`find_upcast_route` — which today handle struct
+  supertypes and numeric casts — and the refusal above.
 - **Splitting the model** into a file holding only the modeled `fn`s and `var`s, no
   CacheIR ops. Kyle wants this "soon". Not blocking: `ir CacheIROps` coexists with the
   model's `ir CacheIR`, and the model's own ops simply go unused. Two facts settled by

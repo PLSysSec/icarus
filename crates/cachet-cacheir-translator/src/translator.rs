@@ -122,13 +122,12 @@ lazy_static! {
 pub fn translate(stub: &stub::Stub) -> Mod {
     let params = Vec::new();
 
-    let mut stmts = vec![Spanned::internal(
-        Expr::Invoke(Call {
-            target: Spanned::internal(*INIT_REG_STATE_PATH),
-            args: Spanned::internal(vec![]),
-        })
-        .into(),
-    )];
+    // `Stmt::Semi`, not `Stmt::Expr`: a call in statement position carries a
+    // semicolon, and only a block or an `if` may stand without one.
+    let mut stmts = vec![Spanned::internal(Stmt::Semi(Expr::Invoke(Call {
+        target: Spanned::internal(*INIT_REG_STATE_PATH),
+        args: Spanned::internal(vec![]),
+    })))];
 
     let operand_ids: BTreeSet<u16> = stub
         .input_operands
@@ -142,21 +141,18 @@ pub fn translate(stub: &stub::Stub) -> Mod {
         }))
         .collect();
     stmts.extend(operand_ids.into_iter().map(|id| {
-        Spanned::internal(
-            Expr::Invoke(Call {
-                target: Spanned::internal(*INIT_OPERAND_ID_PATH),
-                args: Spanned::internal(vec![Spanned::internal(
-                    Expr::Invoke(Call {
-                        target: Spanned::internal(OPERAND_ID_PATH.nest("fromId")),
-                        args: Spanned::internal(vec![Spanned::internal(
-                            Expr::from(Literal::UInt16(id)).into(),
-                        )]),
-                    })
-                    .into(),
-                )]),
-            })
-            .into(),
-        )
+        Spanned::internal(Stmt::Semi(Expr::Invoke(Call {
+            target: Spanned::internal(*INIT_OPERAND_ID_PATH),
+            args: Spanned::internal(vec![Spanned::internal(
+                Expr::Invoke(Call {
+                    target: Spanned::internal(OPERAND_ID_PATH.nest("fromId")),
+                    args: Spanned::internal(vec![Spanned::internal(
+                        Expr::from(Literal::UInt16(id)).into(),
+                    )]),
+                })
+                .into(),
+            )]),
+        })))
     }));
 
     stmts.extend(stub.input_operands.iter().flat_map(|input_operand| {
@@ -167,22 +163,19 @@ pub fn translate(stub: &stub::Stub) -> Mod {
                 }
                 .into(),
             ),
-            Spanned::internal(
-                Expr::Invoke(Call {
-                    target: Spanned::internal(Path::from_ident(format!(
-                        "initInput{}",
-                        type_path_for_operand_id_type(input_operand.data.type_)
-                    ))),
-                    args: Spanned::internal(vec![Spanned::internal(
-                        generate_operand_id_from_id_call(
-                            input_operand.data.id,
-                            input_operand.data.type_,
-                        )
-                        .into(),
-                    )]),
-                })
-                .into(),
-            ),
+            Spanned::internal(Stmt::Semi(Expr::Invoke(Call {
+                target: Spanned::internal(Path::from_ident(format!(
+                    "initInput{}",
+                    type_path_for_operand_id_type(input_operand.data.type_)
+                ))),
+                args: Spanned::internal(vec![Spanned::internal(
+                    generate_operand_id_from_id_call(
+                        input_operand.data.id,
+                        input_operand.data.type_,
+                    )
+                    .into(),
+                )]),
+            }))),
         ]
     }));
 
@@ -194,21 +187,18 @@ pub fn translate(stub: &stub::Stub) -> Mod {
                 }
                 .into(),
             ),
-            Spanned::internal(
-                Expr::Invoke(match output {
-                    stub::MirType::Value => Call {
-                        target: Spanned::internal(*INIT_VALUE_OUTPUT_PATH),
-                        args: Spanned::internal(vec![]),
-                    },
-                    _ => Call {
-                        target: Spanned::internal(*INIT_TYPED_OUTPUT_PATH),
-                        args: Spanned::internal(vec![Spanned::internal(
-                            Expr::from(Spanned::internal(var_path_for_mir_type(*output))).into(),
-                        )]),
-                    },
-                })
-                .into(),
-            ),
+            Spanned::internal(Stmt::Semi(Expr::Invoke(match output {
+                stub::MirType::Value => Call {
+                    target: Spanned::internal(*INIT_VALUE_OUTPUT_PATH),
+                    args: Spanned::internal(vec![]),
+                },
+                _ => Call {
+                    target: Spanned::internal(*INIT_TYPED_OUTPUT_PATH),
+                    args: Spanned::internal(vec![Spanned::internal(
+                        Expr::from(Spanned::internal(var_path_for_mir_type(*output))).into(),
+                    )]),
+                },
+            }))),
         ]);
     }
 

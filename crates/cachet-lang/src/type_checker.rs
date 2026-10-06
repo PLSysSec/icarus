@@ -411,6 +411,14 @@ impl<'a> TypeChecker<'a> {
     fn expect_expr_type(&mut self, expr: Spanned<Expr>, type_index: TypeIndex) -> Expr {
         let expr_span = expr.span;
 
+        // An expression that never reaches its value cannot violate an expectation
+        // about that value, so any expected type is satisfied -- and there is nothing
+        // to cast. This is what lets `if c { 1_i32 } else { unreachable; }` be an
+        // `Int32`, and `let x: Int32 = { return 3_i64; }` type check.
+        if does_expr_exit_early(&expr.value) {
+            return expr.value;
+        }
+
         match self.try_build_cast_chain(CastSafety::Lossless, expr.value, type_index) {
             Ok(expr) => expr,
             Err(expr) => {
@@ -1196,7 +1204,6 @@ impl<'a, 'b> ScopedTypeChecker<'a, 'b> {
         let stmt: Option<Stmt> = match stmt.value {
             resolver::Stmt::Let(let_stmt) => Some(self.type_check_let_stmt(let_stmt).into()),
             resolver::Stmt::Label(LabelStmt { label }) => Some(LabelStmt { label: *label }.into()),
-            resolver::Stmt::If(if_stmt) => Some(self.type_check_if_stmt(if_stmt).into()),
             resolver::Stmt::ForIn(for_in_stmt) => {
                 Some(self.type_check_for_in_stmt(for_in_stmt).into())
             }
@@ -1208,10 +1215,24 @@ impl<'a, 'b> ScopedTypeChecker<'a, 'b> {
             resolver::Stmt::Emit(call) => self.type_check_emit_stmt(call).map(Into::into),
             resolver::Stmt::Ret(ret_stmt) => Some(self.type_check_ret_stmt(ret_stmt).into()),
             resolver::Stmt::Unreachable => Some(Stmt::Unreachable),
-            resolver::Stmt::Expr(expr) => Some(self.type_check_expr(expr).into()),
-            resolver::Stmt::Block(kinded_block) => {
-                Some(self.type_check_block_stmt(kinded_block).into())
+            // No trailing semicolon, so a value would go nowhere: require there not
+            // to be one. The generic check below cannot do this, `Stmt::Expr` being
+            // unit-typed by construction.
+            resolver::Stmt::Expr(expr) => {
+                let expr = self.type_check_expr(expr);
+                let type_ = expr.type_();
+                if !self.is_same_type(type_, BuiltInType::Unit.into()) {
+                    let found_type = self.get_type_ident(type_);
+                    self.errors.push(TypeCheckError::TypeMismatch {
+                        expected_type: BuiltInVar::Unit.ident(),
+                        found_type,
+                        span: stmt_span,
+                    });
+                }
+                Some(expr.into())
             }
+            // A trailing semicolon discards the value, whatever its type.
+            resolver::Stmt::Semi(expr) => Some(self.type_check_expr(expr).into()),
         };
 
         if let Some(stmt) = &stmt {
@@ -1227,22 +1248,6 @@ impl<'a, 'b> ScopedTypeChecker<'a, 'b> {
         }
 
         stmt
-    }
-
-    fn type_check_block_stmt(&mut self, kinded_block: &resolver::KindedBlock) -> Expr {
-        let typed_kinded_block = self.type_check_kinded_block(kinded_block);
-        let type_ = typed_kinded_block.type_();
-        if type_ != BuiltInType::Unit.into() {
-            let expected_type = self.get_type_ident(BuiltInType::Unit.into());
-            let found_type = self.get_type_ident(type_);
-            self.errors.push(TypeCheckError::TypeMismatch {
-                expected_type,
-                found_type,
-                span: kinded_block.block.value.span,
-            });
-        }
-
-        typed_kinded_block.into()
     }
 
     fn type_check_let_stmt(&mut self, let_stmt: &resolver::LetStmt) -> LetStmt {
@@ -1264,24 +1269,55 @@ impl<'a, 'b> ScopedTypeChecker<'a, 'b> {
         }
     }
 
-    fn type_check_if_stmt(&mut self, if_stmt: &resolver::IfStmt) -> IfStmt {
+    /// An `if` yields its `then` arm's type, so the arms have to agree -- otherwise
+    /// the type would depend on which branch ran.
+    ///
+    /// Without an `else` there is no second arm to produce a value on the other
+    /// path, so the `then` arm must be unit-typed. That is Rust's rule, and it is
+    /// what makes `if c { 1 } else { 2 }` in statement position an error rather than
+    /// a silent discard.
+    fn type_check_if_expr(&mut self, if_expr: &resolver::IfExpr) -> IfExpr {
         let cond =
-            self.type_check_expr_expecting_type(if_stmt.cond.as_ref(), BuiltInType::Bool.into());
+            self.type_check_expr_expecting_type(if_expr.cond.as_ref(), BuiltInType::Bool.into());
 
-        // TODO(spinda): Check that all branches have the same type.
+        let then = self.type_check_block(&if_expr.then);
 
-        let then = self.type_check_block(&if_stmt.then);
-
-        let else_ = if_stmt.else_.as_ref().map(|else_| match else_ {
+        let else_ = if_expr.else_.as_ref().map(|else_| match else_ {
             resolver::ElseClause::ElseIf(else_if) => {
-                ast::ElseClause::ElseIf(Box::new(self.type_check_if_stmt(&*else_if)))
+                ast::ElseClause::ElseIf(Box::new(self.type_check_if_expr(&*else_if)))
             }
             resolver::ElseClause::Else(else_block) => {
                 ast::ElseClause::Else(self.type_check_block(else_block))
             }
         });
 
-        IfStmt { cond, then, else_ }
+        // What each path contributes to the type, `None` where it never reaches a
+        // value and so says nothing. Without an `else` the other path falls through
+        // and contributes unit, which is what makes a valued `then` an error there.
+        //
+        // `IfExpr::type_` reads the contributing arm by the same rule; the two have
+        // to stay in step.
+        let then_type = (!then.exits_early).then(|| then.type_());
+        let else_type = match &else_ {
+            Some(ElseClause::Else(else_block)) if else_block.exits_early => None,
+            Some(ElseClause::ElseIf(else_if)) if does_if_expr_exit_early(else_if) => None,
+            Some(else_) => Some(else_.type_()),
+            None => Some(BuiltInType::Unit.into()),
+        };
+
+        if let (Some(then_type), Some(else_type)) = (then_type, else_type) {
+            if !self.is_same_type(then_type, else_type) {
+                let expected_type = self.get_type_ident(else_type);
+                let found_type = self.get_type_ident(then_type);
+                self.errors.push(TypeCheckError::TypeMismatch {
+                    expected_type,
+                    found_type,
+                    span: if_expr.then.value.span,
+                });
+            }
+        }
+
+        IfExpr { cond, then, else_ }
     }
 
     fn type_check_for_in_stmt(&mut self, for_in_stmt: &resolver::ForInStmt) -> ForInStmt {
@@ -1453,6 +1489,7 @@ impl<'a, 'b> ScopedTypeChecker<'a, 'b> {
     fn type_check_expr(&mut self, expr: &resolver::Expr) -> Expr {
         match expr {
             resolver::Expr::Block(block) => self.type_check_kinded_block(block).into(),
+            resolver::Expr::If(if_expr) => self.type_check_if_expr(if_expr).into(),
             resolver::Expr::Literal(literal) => literal.into(),
             resolver::Expr::Var(var_index) => self.type_check_var_expr(*var_index).into(),
             resolver::Expr::Invoke(call) => self.type_check_invoke_expr(call).into(),
@@ -1835,7 +1872,6 @@ struct ParamSummary {
 fn does_stmt_exit_early(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Let(LetStmt { rhs: expr, .. }) | Stmt::Expr(expr) => does_expr_exit_early(expr),
-        Stmt::If(if_stmt) => does_if_stmt_exit_early(if_stmt),
         Stmt::ForIn(for_in_stmt) => for_in_stmt.body.exits_early,
         // `unreachable` claims control never gets past it, so a block ending in
         // one never reaches its value, and the callable's return type is
@@ -1845,14 +1881,14 @@ fn does_stmt_exit_early(stmt: &Stmt) -> bool {
     }
 }
 
-fn does_if_stmt_exit_early(if_stmt: &IfStmt) -> bool {
-    if does_expr_exit_early(&if_stmt.cond) {
+fn does_if_expr_exit_early(if_expr: &IfExpr) -> bool {
+    if does_expr_exit_early(&if_expr.cond) {
         return true;
     }
 
-    if_stmt.then.exits_early
-        && match &if_stmt.else_ {
-            Some(ElseClause::ElseIf(else_if)) => does_if_stmt_exit_early(else_if),
+    if_expr.then.exits_early
+        && match &if_expr.else_ {
+            Some(ElseClause::ElseIf(else_if)) => does_if_expr_exit_early(else_if),
             Some(ElseClause::Else(else_block)) => else_block.exits_early,
             None => false,
         }
@@ -1861,6 +1897,7 @@ fn does_if_stmt_exit_early(if_stmt: &IfStmt) -> bool {
 fn does_expr_exit_early(expr: &Expr) -> bool {
     match expr {
         Expr::Block(kinded_block) => kinded_block.block.exits_early,
+        Expr::If(if_expr) => does_if_expr_exit_early(if_expr),
         Expr::Literal(_) | Expr::Var(_) | Expr::Invoke(_) => false,
         Expr::FieldAccess(field_access_expr) => does_expr_exit_early(&field_access_expr.parent),
         Expr::Negate(negate_expr) => does_expr_exit_early(&negate_expr.expr),
@@ -1890,7 +1927,13 @@ fn is_const(expr: &Expr) -> bool {
             BinOper::Logical(_) => false,
         },
         Expr::Negate(e) => is_const(&e.expr),
-        Expr::Invoke(_) | Expr::FieldAccess(_) | Expr::Block(_) | Expr::Assign(_) => false,
+        // `If` joins `Block` here for the reason given for the logical operators:
+        // the normalizer lowers it to statements, which a constant cannot be.
+        Expr::Invoke(_)
+        | Expr::FieldAccess(_)
+        | Expr::Block(_)
+        | Expr::If(_)
+        | Expr::Assign(_) => false,
         Expr::Cast(cast_expr) => {
             is_const(&cast_expr.expr) && matches!(cast_expr.type_, TypeIndex::BuiltIn(_))
         }

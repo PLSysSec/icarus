@@ -330,8 +330,6 @@ pub enum Stmt {
     #[from]
     Label(LabelStmt),
     #[from]
-    If(IfStmt),
-    #[from]
     ForIn(ForInStmt),
     #[from]
     Check(CheckStmt),
@@ -353,7 +351,6 @@ impl Typed for Stmt {
         match self {
             Self::Let(let_stmt) => let_stmt.type_(),
             Self::Label(label_stmt) => label_stmt.type_(),
-            Self::If(if_stmt) => if_stmt.type_(),
             Self::ForIn(for_in_stmt) => for_in_stmt.type_(),
             Self::Check(check_stmt) => check_stmt.type_(),
             Self::Goto(goto_stmt) => goto_stmt.type_(),
@@ -381,22 +378,35 @@ impl Typed for LetStmt {
 }
 
 #[derive(Clone, Debug)]
-pub struct IfStmt {
+pub struct IfExpr {
     pub cond: Expr,
     pub then: Block,
     pub else_: Option<ElseClause>,
 }
 
-impl Typed for IfStmt {
+impl Typed for IfExpr {
+    /// An arm that never reaches its value contributes no type, so the type is
+    /// whichever arm does contribute one -- which is what makes
+    /// `if c { unreachable; } else { 1_i32 }` an `Int32`. With no `else`, the other
+    /// path falls through producing nothing, so neither does the `if`.
+    ///
+    /// `type_check_if_expr` decides from the same rule which arms have to agree, and
+    /// the two must stay in step.
     fn type_(&self) -> TypeIndex {
-        BuiltInType::Unit.into()
+        if !self.then.exits_early {
+            return self.then.type_();
+        }
+        match &self.else_ {
+            Some(else_) => else_.type_(),
+            None => BuiltInType::Unit.into(),
+        }
     }
 }
 
 #[derive(Clone, Debug, From)]
 pub enum ElseClause {
     #[from]
-    ElseIf(Box<IfStmt>),
+    ElseIf(Box<IfExpr>),
     #[from]
     Else(Block),
 }
@@ -404,7 +414,7 @@ pub enum ElseClause {
 impl Typed for ElseClause {
     fn type_(&self) -> TypeIndex {
         match self {
-            Self::ElseIf(if_stmt) => if_stmt.type_(),
+            Self::ElseIf(if_expr) => if_expr.type_(),
             Self::Else(block) => block.type_(),
         }
     }
@@ -488,6 +498,8 @@ pub enum Expr {
     #[from]
     Block(Box<KindedBlock>),
     #[from]
+    If(Box<IfExpr>),
+    #[from]
     Literal(Literal),
     #[from(types(BuiltInVar, "&BuiltInVar"))]
     Var(VarExpr),
@@ -509,6 +521,7 @@ impl Typed for Expr {
     fn type_(&self) -> TypeIndex {
         match self {
             Expr::Block(block_expr) => block_expr.type_(),
+            Expr::If(if_expr) => if_expr.type_(),
             Expr::Literal(literal) => literal.type_(),
             Expr::Var(var_expr) => var_expr.type_(),
             Expr::Invoke(call_expr) => call_expr.type_(),
@@ -522,6 +535,7 @@ impl Typed for Expr {
 }
 
 box_from!(KindedBlock => Expr);
+box_from!(IfExpr => Expr);
 box_from!(FieldAccessExpr => Expr);
 box_from!(NegateExpr => Expr);
 box_from!(CastExpr => Expr);
