@@ -18,5 +18,8 @@ target/
 # SpiderMonkey directory for Phoenix
 mozilla-central/
 
+# Editor settings are per-user; see crates/phoenix/README.md for clangd setup
+/.vscode/
+
 # Scratch work
 scratch/

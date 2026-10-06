@@ -19,6 +19,8 @@ afterwards:
 3. `mach configure` — debug JS-shell-only build into `obj-js`
 4. `mach build pre-export export` — generates headers `CacheIR.cpp` includes
 5. `mach build-backend -b CompileDB` — writes `obj-js/compile_commands.json`
+6. `mach build-backend -b Clangd` — writes `obj-js/clangd/`, and a
+   `mozilla-central/.clangd` pointing at it (see [Editor setup](#editor-setup))
 
 No C++ is compiled. First build takes ~10 minutes, nearly all download.
 Cargo hides build-script output; progress goes to `cargo:warning` lines and the
@@ -35,6 +37,33 @@ Overrides:
 | `PHOENIX_SKIP_SETUP=1` | skip setup entirely; pass `--db` at run time |
 | `MOZBUILD_STATE_PATH` | mach's toolchain dir (default `~/.mozbuild`) |
 | `LIBCLANG_PATH` | use a different libclang at run time |
+
+### Editor setup
+
+Setup leaves the checkout ready for clangd (go-to-definition, hover types, and
+so on in the SpiderMonkey sources). Any clangd-based editor picks up
+`mozilla-central/.clangd` on its own, because clangd finds it by walking up from
+the file it opens, so it also works with `icarus/` open as the workspace root.
+No editor config is written; for VS Code:
+
+1. Install the clangd extension (`llvm-vs-code-extensions.vscode-clangd`), and
+   disable Microsoft C/C++ IntelliSense if you have it
+   (`"C_Cpp.intelliSenseEngine": "disabled"`).
+2. In `icarus/.vscode/settings.json` (gitignored), point it at Mozilla's
+   clangd, which matches the vendored clang the compile commands were written
+   for, and keep VS Code from crawling the objdir:
+
+   ```jsonc
+   {
+       "clangd.path": "<home>/.mozbuild/clang-tools/clang-tidy/bin/clangd",
+       "files.watcherExclude": { "mozilla-central/obj-js/**": true },
+       "search.exclude": { "mozilla-central/obj-js/**": true }
+   }
+   ```
+
+Don't use `mach ide vscode` here: it writes `mozilla-central/.vscode/`, which VS
+Code ignores unless that directory is the workspace root, and without
+`MOZCONFIG=mozconfig-phoenix` it configures a full Firefox build instead.
 
 The vendored toolchain for the Firefox-93-era `icarus-firefox` tree has expired
 upstream, which is why a current mozilla-central is used as the parsing target.

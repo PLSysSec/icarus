@@ -8,6 +8,8 @@
 //!   4. `mach build pre-export export` — runs the code generators that
 //!      produce headers CacheIR.cpp includes (no C++ is compiled)
 //!   5. `mach build-backend -b CompileDB` — emits compile_commands.json
+//!   6. `mach build-backend -b Clangd` plus a `.clangd` pointing at it, so any
+//!      clangd-based editor works on the checkout; no editor config is written
 //!
 //! Every step is skipped when its output already exists, so rebuilds are
 //! free. The resulting paths are exported to the crate as
@@ -91,6 +93,7 @@ fn main() {
     setup.configure();
     setup.export();
     setup.compile_db();
+    setup.clangd();
     assert!(
         compile_db.is_file(),
         "setup finished but {} is missing",
@@ -209,6 +212,22 @@ impl Setup {
         }
         self.warn("running `mach build-backend -b CompileDB`");
         self.mach(&["build-backend", "-b", "CompileDB"]);
+    }
+
+    /// The same settings `mach ide vscode` puts in `.clangd`. That backend's
+    /// database lists sources one per entry with no `Unified_*.cpp`, which is
+    /// what clangd wants. `.clangd` is in mozilla-central's own `.gitignore`.
+    fn clangd(&self) {
+        let db_dir = self.objdir.join("clangd");
+        if !db_dir.join("compile_commands.json").exists() {
+            self.warn("running `mach build-backend -b Clangd` (editor support)");
+            self.mach(&["build-backend", "-b", "Clangd"]);
+        }
+        let config = format!(
+            "CompileFlags:\n  CompilationDatabase: {:?}\nCompletion:\n  HeaderInsertion: Never\n",
+            db_dir.display().to_string()
+        );
+        fs::write(self.moz_central.join(".clangd"), config).unwrap();
     }
 
     fn mach(&self, args: &[&str]) {
